@@ -25,8 +25,13 @@ from acestep.apg_guidance import apg_forward, MomentumBuffer
 from tqdm import tqdm
 import random
 import os
+import warnings
 from acestep.pipeline_ace_step import ACEStepPipeline
 
+
+# Suppress CUDA capability warnings for newer GPUs (e.g., RTX 5060 Ti with sm_120)
+# PyTorch may warn about unsupported CUDA capabilities, but GPU can still work
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
@@ -74,6 +79,15 @@ class Pipeline(LightningModule):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logger.info("GPU cache cleared")
+            # Log GPU information for debugging with newer GPUs
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_capability = torch.cuda.get_device_capability(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            logger.info(f"GPU: {gpu_name}, Compute Capability: {gpu_capability[0]}.{gpu_capability[1]}, Memory: {gpu_memory:.2f} GB")
+            # Warn if CUDA capability is very new (sm_120+) but continue
+            if gpu_capability[0] >= 12:
+                logger.warning(f"GPU has compute capability sm_{gpu_capability[0]}{gpu_capability[1]} which is very new. "
+                             "PyTorch may show warnings, but GPU should still work.")
 
         logger.info("Preparing transformer for LoRA...")
         # Move to CPU first, then convert to float to avoid OOM
