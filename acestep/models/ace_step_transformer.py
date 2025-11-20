@@ -366,11 +366,25 @@ class ACEStepTransformer2DModel(
         lyric_mask: Optional[torch.LongTensor] = None,
     ):
         # N x T x D
+        target_device = self.lyric_embs.weight.device
+        encoder_device = next(self.lyric_encoder.parameters()).device
+        if lyric_token_idx.device != target_device:
+            lyric_token_idx = lyric_token_idx.to(target_device)
         lyric_embs = self.lyric_embs(lyric_token_idx)
+        if lyric_mask is not None and lyric_mask.device != encoder_device:
+            lyric_mask = lyric_mask.to(encoder_device)
         prompt_prenet_out, _mask = self.lyric_encoder(
-            lyric_embs, lyric_mask, decoding_chunk_size=1, num_decoding_left_chunks=-1
+            lyric_embs.to(encoder_device),
+            lyric_mask,
+            decoding_chunk_size=1,
+            num_decoding_left_chunks=-1,
         )
         prompt_prenet_out = self.lyric_proj(prompt_prenet_out)
+        if (
+            prompt_prenet_out.device != lyric_mask.device
+            and lyric_mask is not None
+        ):
+            prompt_prenet_out = prompt_prenet_out.to(lyric_mask.device)
         return prompt_prenet_out
 
     def encode(
@@ -386,17 +400,39 @@ class ACEStepTransformer2DModel(
         device = encoder_text_hidden_states.device
 
         # speaker embedding
+        spk_device = self.speaker_embedder.weight.device
+        spk_dtype = self.speaker_embedder.weight.dtype
+        speaker_embeds = speaker_embeds.to(device=spk_device, dtype=spk_dtype)
         encoder_spk_hidden_states = self.speaker_embedder(speaker_embeds).unsqueeze(1)
+        if encoder_spk_hidden_states.device != device or encoder_spk_hidden_states.dtype != encoder_text_hidden_states.dtype:
+            encoder_spk_hidden_states = encoder_spk_hidden_states.to(
+                device=device, dtype=encoder_text_hidden_states.dtype
+            )
         speaker_mask = torch.ones(bs, 1, device=device)
 
         # genre embedding
+        genre_device = self.genre_embedder.weight.device
+        genre_dtype = self.genre_embedder.weight.dtype
+        if (
+            encoder_text_hidden_states.device != genre_device
+            or encoder_text_hidden_states.dtype != genre_dtype
+        ):
+            encoder_text_hidden_states = encoder_text_hidden_states.to(
+                device=genre_device, dtype=genre_dtype
+            )
         encoder_text_hidden_states = self.genre_embedder(encoder_text_hidden_states)
+        if encoder_text_hidden_states.device != device:
+            encoder_text_hidden_states = encoder_text_hidden_states.to(device)
 
         # lyric
         encoder_lyric_hidden_states = self.forward_lyric_encoder(
             lyric_token_idx=lyric_token_idx,
             lyric_mask=lyric_mask,
         )
+        if encoder_lyric_hidden_states.device != device:
+            encoder_lyric_hidden_states = encoder_lyric_hidden_states.to(device)
+        if lyric_mask.device != device:
+            lyric_mask = lyric_mask.to(device)
 
         encoder_hidden_states = torch.cat(
             [
@@ -426,6 +462,46 @@ class ACEStepTransformer2DModel(
         controlnet_scale: Union[float, torch.Tensor] = 1.0,
         return_dict: bool = True,
     ):
+
+        model_device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
+        hidden_states = hidden_states.to(device=model_device, dtype=model_dtype)
+        attention_mask = attention_mask.to(device=model_device) if attention_mask is not None else None
+        encoder_hidden_states = encoder_hidden_states.to(device=model_device, dtype=model_dtype)
+        encoder_hidden_mask = encoder_hidden_mask.to(device=model_device)
+        if timestep is not None:
+            timestep = timestep.to(device=model_device)
+        if ssl_hidden_states is not None:
+            converted_ssl_hidden_states = []
+            for ssl_hidden_state in ssl_hidden_states:
+                if ssl_hidden_state is None:
+                    converted_ssl_hidden_states.append(None)
+                elif isinstance(ssl_hidden_state, list):
+                    # Handle list of tensors (e.g., batch of SSL features)
+                    converted_ssl_hidden_states.append([
+                        tensor.to(device=model_device, dtype=model_dtype)
+                        if tensor is not None and isinstance(tensor, torch.Tensor)
+                        else tensor
+                        for tensor in ssl_hidden_state
+                    ])
+                elif isinstance(ssl_hidden_state, torch.Tensor):
+                    # Handle single tensor
+                    converted_ssl_hidden_states.append(ssl_hidden_state.to(device=model_device, dtype=model_dtype))
+                else:
+                    converted_ssl_hidden_states.append(ssl_hidden_state)
+            ssl_hidden_states = converted_ssl_hidden_states
+        if block_controlnet_hidden_states is not None:
+            if isinstance(block_controlnet_hidden_states, list):
+                block_controlnet_hidden_states = [
+                    block.to(device=model_device, dtype=model_dtype)
+                    for block in block_controlnet_hidden_states
+                ]
+            else:
+                block_controlnet_hidden_states = block_controlnet_hidden_states.to(
+                    device=model_device, dtype=model_dtype
+                )
+        if isinstance(controlnet_scale, torch.Tensor):
+            controlnet_scale = controlnet_scale.to(device=model_device, dtype=model_dtype)
 
         embedded_timestep = self.timestep_embedder(
             self.time_proj(timestep).to(dtype=hidden_states.dtype)

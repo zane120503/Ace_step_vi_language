@@ -44,12 +44,13 @@ class LinearSpectrogram(nn.Module):
             mode="reflect",
         ).squeeze(1)
         dtype = y.dtype
+        window = self.window.to(device=y.device, dtype=y.dtype)
         spec = torch.stft(
             y.float(),
             self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window,
+            window=window,
             center=self.center,
             pad_mode="reflect",
             normalized=False,
@@ -106,7 +107,8 @@ class LogMelSpectrogram(nn.Module):
 
     def forward(self, x: Tensor, return_linear: bool = False) -> Tensor:
         linear = self.spectrogram(x)
-        x = self.mel_scale(linear)
+        mel_scale = self.mel_scale.to(linear.device, dtype=linear.dtype)
+        x = mel_scale(linear)
         x = self.compress(x)
         # print(x.shape)
         if return_linear:

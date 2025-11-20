@@ -13,6 +13,11 @@ from acestep.language_segmentation import LangSegment
 from acestep.models.lyrics_utils.lyric_tokenizer import VoiceBpeTokenizer
 import warnings
 
+try:
+    import librosa
+except ImportError:  # pragma: no cover - optional dependency
+    librosa = None
+
 warnings.simplefilter("ignore", category=FutureWarning)
 
 DEFAULT_TRAIN_PATH = "./data/example_dataset"
@@ -57,6 +62,7 @@ SUPPORT_LANGUAGES = {
     "hu": 5753,
     "ko": 6152,
     "hi": 6680,
+    "vi": 775,  # Vietnamese - token ID from vocab.json
 }
 
 # Regex pattern for structure markers like [Verse], [Chorus], etc.
@@ -200,6 +206,9 @@ class Text2MusicDataset(Dataset):
         # Initialize lyric tokenizer
         self.lyric_tokenizer = VoiceBpeTokenizer()
 
+        # Check optional audio fallback availability
+        self.librosa_available = librosa is not None
+
         # Load dataset
         self.setup_full(train, shuffle, sample_size)
         logger.info(f"Dataset size: {len(self)} total {self.total_samples} samples")
@@ -240,15 +249,18 @@ class Text2MusicDataset(Dataset):
         """
         language = "en"
         langs = []
+        langCounts = []  # Initialize langCounts to avoid UnboundLocalError
         try:
             langs = self.lang_segment.getTexts(text)
             langCounts = self.lang_segment.getCounts()
-            language = langCounts[0][0]
-            # If primary language is English but there's another language, use the second one
-            if len(langCounts) > 1 and language == "en":
-                language = langCounts[1][0]
+            if len(langCounts) > 0:
+                language = langCounts[0][0]
+                # If primary language is English but there's another language, use the second one
+                if len(langCounts) > 1 and language == "en":
+                    language = langCounts[1][0]
         except Exception:
             language = "en"
+            # langCounts already initialized as empty list
         return language, langs, langCounts
 
     def tokenize_lyrics(self, lyrics, debug=False, key=None):
@@ -305,7 +317,18 @@ class Text2MusicDataset(Dataset):
                         token_idx = self.lyric_tokenizer.encode(line, "en")
                     else:
                         # Try tokenizing with most common language first
-                        token_idx = self.lyric_tokenizer.encode(line, most_common_lang)
+                        # If language is Vietnamese (vi) and tokenizer doesn't support it, fallback to English
+                        tokenize_lang = most_common_lang
+                        if most_common_lang == "vi":
+                            try:
+                                token_idx = self.lyric_tokenizer.encode(line, "vi")
+                            except (NotImplementedError, ValueError):
+                                # Tokenizer may not support Vietnamese preprocessing, use English
+                                logger.debug(f"Tokenizer doesn't support 'vi', using 'en' for line: {line[:50]}...")
+                                tokenize_lang = "en"
+                                token_idx = self.lyric_tokenizer.encode(line, "en")
+                        else:
+                            token_idx = self.lyric_tokenizer.encode(line, most_common_lang)
 
                         # If debug mode, show tokenization results
                         if debug:
@@ -313,12 +336,20 @@ class Text2MusicDataset(Dataset):
                                 [[tok_id] for tok_id in token_idx]
                             )
                             logger.info(
-                                f"debug using most_common_lang {line} --> {most_common_lang} --> {toks}"
+                                f"debug using {tokenize_lang} {line} --> {most_common_lang} --> {toks}"
                             )
 
-                        # If tokenization contains unknown token (1), try with segment language
+                        # If tokenization contains unknown token (1), try with segment language or English
                         if 1 in token_idx:
-                            token_idx = self.lyric_tokenizer.encode(line, lang)
+                            if lang != tokenize_lang and lang in SUPPORT_LANGUAGES:
+                                try:
+                                    token_idx = self.lyric_tokenizer.encode(line, lang)
+                                except (NotImplementedError, ValueError):
+                                    # Fallback to English if segment language not supported
+                                    token_idx = self.lyric_tokenizer.encode(line, "en")
+                            elif tokenize_lang != "en":
+                                # Try English as last resort
+                                token_idx = self.lyric_tokenizer.encode(line, "en")
 
                     if debug:
                         toks = self.lyric_tokenizer.batch_decode(
@@ -397,13 +428,16 @@ class Text2MusicDataset(Dataset):
         """
         filename = item["filename"]
         sr = 48000
+        audio = None
         try:
             audio, sr = torchaudio.load(filename)
         except Exception as e:
-            logger.error(f"Failed to load audio {item}: {e}")
-            return None
+            logger.warning(
+                f"torchaudio failed to load {filename} due to {e}. Attempting librosa fallback..."
+            )
+            audio, sr = self._load_audio_with_librosa(filename)
 
-        if audio is None:
+        if audio is None or sr is None:
             logger.error(f"Failed to load audio {item}")
             return None
 
@@ -433,6 +467,30 @@ class Text2MusicDataset(Dataset):
             return None
 
         return audio
+
+    def _load_audio_with_librosa(self, filename, target_sr=48000):
+        """
+        Fallback audio loader using librosa when torchaudio fails (e.g. missing torchcodec for MP3).
+        """
+        if not self.librosa_available:
+            return None, None
+
+        try:
+            waveform, sr = librosa.load(filename, sr=target_sr, mono=False)
+            if waveform.ndim == 1:
+                waveform = np.stack([waveform, waveform], axis=0)
+            elif waveform.ndim == 2:
+                pass
+            else:
+                waveform = np.asarray(waveform)
+                if waveform.ndim > 2:
+                    waveform = waveform.reshape(waveform.shape[0], -1)
+
+            audio = torch.from_numpy(waveform).float()
+            return audio, sr
+        except Exception as e:
+            logger.error(f"Librosa fallback also failed for {filename}: {e}")
+            return None, None
 
     def process(self, item):
         """
@@ -650,16 +708,18 @@ class Text2MusicDataset(Dataset):
 
         return output
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, retry_count=0):
         """
         Get item at index with error handling
 
         Args:
             idx: Dataset index
+            retry_count: Number of retries attempted (to prevent infinite recursion)
 
         Returns:
             dict: Example features
         """
+        max_retries = 10  # Maximum number of retries
         try:
             example = self.get_full_features(idx)
             if len(example["keys"]) == 0:
@@ -667,10 +727,14 @@ class Text2MusicDataset(Dataset):
             return example
         except Exception as e:
             # Log error and try a different random index
-            logger.error(f"Error in getting item {idx}: {e}")
-            traceback.print_exc()
-            new_idx = random.choice(range(len(self)))
-            return self.__getitem__(new_idx)
+            if retry_count < max_retries:
+                logger.warning(f"Error in getting item {idx} (retry {retry_count + 1}/{max_retries}): {e}")
+                new_idx = random.choice(range(len(self)))
+                return self.__getitem__(new_idx, retry_count + 1)
+            else:
+                # After max retries, raise the exception
+                logger.error(f"Failed to get item after {max_retries} retries. Last error: {e}")
+                raise RuntimeError(f"Failed to get valid item after {max_retries} retries. Original error: {e}") from e
 
 
 if __name__ == "__main__":

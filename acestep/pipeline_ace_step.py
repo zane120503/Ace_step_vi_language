@@ -47,6 +47,7 @@ from acestep.apg_guidance import (
     cfg_double_condition_forward,
 )
 import torchaudio
+import soundfile as sf
 from .cpu_offload import cpu_offload
 
 
@@ -1393,13 +1394,49 @@ class ACEStepPipeline:
                 output_path_wav = save_path
 
         target_wav = target_wav.float()
-        backend = "soundfile"
-        if format == "ogg":
-            backend = "sox"
-        logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
-        torchaudio.save(
-            output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
-        )
+        
+        # Use soundfile directly for wav format to avoid torchcodec dependency issues
+        if format == "wav":
+            # Convert to numpy and ensure correct shape
+            audio_np = target_wav.cpu().numpy()
+            # soundfile expects (samples,) for mono or (samples, channels) for stereo
+            # torchaudio format is (channels, samples), so we need to transpose
+            if len(audio_np.shape) == 2:
+                # (channels, samples) -> (samples, channels)
+                audio_np = audio_np.T
+            elif len(audio_np.shape) == 3:
+                # Handle batch dimension: (batch, channels, samples) -> (samples, channels)
+                audio_np = audio_np[0].T
+            # If shape is 1D, it's already (samples,) which is correct for mono
+            
+            logger.info(f"Saving audio to {output_path_wav} using backend soundfile")
+            sf.write(output_path_wav, audio_np, sample_rate)
+        else:
+            # For other formats (ogg, etc.), use torchaudio with sox backend
+            backend = "sox" if format == "ogg" else "soundfile"
+            logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
+            try:
+                torchaudio.save(
+                    output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
+                )
+            except RuntimeError as e:
+                # Fallback to soundfile if torchaudio fails
+                if "torchcodec" in str(e).lower() or "ffmpeg" in str(e).lower():
+                    logger.warning(f"torchaudio.save failed with {e}, falling back to soundfile")
+                    audio_np = target_wav.cpu().numpy()
+                    # Convert shape: (channels, samples) -> (samples, channels)
+                    if len(audio_np.shape) == 2:
+                        audio_np = audio_np.T
+                    elif len(audio_np.shape) == 3:
+                        audio_np = audio_np[0].T
+                    # Convert to wav if format not supported by soundfile
+                    if format != "wav":
+                        output_path_wav = output_path_wav.rsplit('.', 1)[0] + '.wav'
+                        logger.info(f"Converting format to wav: {output_path_wav}")
+                    sf.write(output_path_wav, audio_np, sample_rate)
+                else:
+                    raise
+        
         return output_path_wav
 
     @cpu_offload("music_dcae")

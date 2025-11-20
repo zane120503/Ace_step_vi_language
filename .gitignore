@@ -202,3 +202,15 @@ pipeline_ace_step_demo.py
 *.wav
 start.sh
 exps/*
+
+# Training data (do not commit audio files to avoid large files)
+data/*.mp3
+data/*.wav
+data/*.flac
+# Keep text files and templates in data/
+!data/*.txt
+!data/*.md
+
+# Dataset files (too large to commit)
+*_lora_dataset/
+*.arrow

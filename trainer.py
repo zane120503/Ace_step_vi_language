@@ -64,14 +64,36 @@ class Pipeline(LightningModule):
         self.scheduler = self.get_scheduler()
 
         # step 1: load model
+        logger.info("Initializing ACEStepPipeline...")
         acestep_pipeline = ACEStepPipeline(checkpoint_dir)
+        logger.info("Loading ACE-Step checkpoint...")
         acestep_pipeline.load_checkpoint(acestep_pipeline.checkpoint_dir)
+        logger.info("ACE-Step checkpoint loaded successfully")
 
-        transformers = acestep_pipeline.ace_step_transformer.float().cpu()
+        # Clear GPU cache before converting models
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("GPU cache cleared")
+
+        logger.info("Preparing transformer for LoRA...")
+        # Move to CPU first, then convert to float to avoid OOM
+        try:
+            model_device = next(acestep_pipeline.ace_step_transformer.parameters()).device
+            if model_device.type == 'cuda':
+                logger.info("Moving transformer to CPU...")
+                acestep_pipeline.ace_step_transformer = acestep_pipeline.ace_step_transformer.cpu()
+                torch.cuda.empty_cache()
+        except:
+            # If can't determine device, just move to CPU to be safe
+            logger.info("Moving transformer to CPU (device check failed)...")
+            acestep_pipeline.ace_step_transformer = acestep_pipeline.ace_step_transformer.cpu()
+            torch.cuda.empty_cache()
+        transformers = acestep_pipeline.ace_step_transformer.float()
         transformers.enable_gradient_checkpointing()
 
         assert lora_config_path is not None, "Please provide a LoRA config path"
         if lora_config_path is not None:
+            logger.info(f"Loading LoRA config from {lora_config_path}...")
             try:
                 from peft import LoraConfig
             except ImportError:
@@ -82,13 +104,36 @@ class Pipeline(LightningModule):
             lora_config = LoraConfig(**lora_config)
             transformers.add_adapter(adapter_config=lora_config, adapter_name=adapter_name)
             self.adapter_name = adapter_name
+            logger.info("LoRA adapter added successfully")
 
         self.transformers = transformers
 
-        self.dcae = acestep_pipeline.music_dcae.float().cpu()
+        # Move DCAE to CPU first if on GPU
+        try:
+            dcae_device = next(acestep_pipeline.music_dcae.parameters()).device
+            if dcae_device.type == 'cuda':
+                logger.info("Moving DCAE to CPU...")
+                acestep_pipeline.music_dcae = acestep_pipeline.music_dcae.cpu()
+                torch.cuda.empty_cache()
+        except:
+            logger.info("Moving DCAE to CPU (device check failed)...")
+            acestep_pipeline.music_dcae = acestep_pipeline.music_dcae.cpu()
+            torch.cuda.empty_cache()
+        self.dcae = acestep_pipeline.music_dcae.float()
         self.dcae.requires_grad_(False)
 
-        self.text_encoder_model = acestep_pipeline.text_encoder_model.float().cpu()
+        # Move text encoder to CPU first if on GPU
+        try:
+            text_device = next(acestep_pipeline.text_encoder_model.parameters()).device
+            if text_device.type == 'cuda':
+                logger.info("Moving text encoder to CPU...")
+                acestep_pipeline.text_encoder_model = acestep_pipeline.text_encoder_model.cpu()
+                torch.cuda.empty_cache()
+        except:
+            logger.info("Moving text encoder to CPU (device check failed)...")
+            acestep_pipeline.text_encoder_model = acestep_pipeline.text_encoder_model.cpu()
+            torch.cuda.empty_cache()
+        self.text_encoder_model = acestep_pipeline.text_encoder_model.float()
         self.text_encoder_model.requires_grad_(False)
         self.text_tokenizer = acestep_pipeline.text_tokenizer
 
@@ -96,10 +141,12 @@ class Pipeline(LightningModule):
             self.transformers.train()
 
             # download first
+            logger.info("Loading MERT model...")
             try:
                 self.mert_model = AutoModel.from_pretrained(
                     "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
                 ).eval()
+                logger.info("MERT model loaded successfully")
             except:
                 import json
                 import os
@@ -124,27 +171,54 @@ class Pipeline(LightningModule):
                 ).eval()
             self.mert_model.requires_grad_(False)
             self.resampler_mert = torchaudio.transforms.Resample(
-                orig_freq=48000, new_freq=24000
+                orig_freq=48000, new_freq=24000, dtype=torch.float32
             )
             self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
                 "m-a-p/MERT-v1-330M", trust_remote_code=True
             )
+            logger.info("MERT processor loaded successfully")
 
+            logger.info("Loading mHuBERT model...")
             self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
+            logger.info("mHuBERT model loaded successfully")
             self.hubert_model.requires_grad_(False)
             self.resampler_mhubert = torchaudio.transforms.Resample(
-                orig_freq=48000, new_freq=16000
+                orig_freq=48000, new_freq=16000, dtype=torch.float32
             )
             self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained(
                 "utter-project/mHuBERT-147",
                 cache_dir=checkpoint_dir,
             )
+            logger.info("mHuBERT processor loaded successfully")
+            logger.info("All SSL models loaded. Initialization complete.")
 
             self.ssl_coeff = ssl_coeff
+    
+    def to(self, *args, **kwargs):
+        """Override to() to prevent Lightning from moving entire model to GPU.
+        We'll handle device placement manually in training_step to avoid OOM."""
+        # If Lightning tries to move to CUDA, we'll keep models on CPU
+        # and only move them temporarily during forward pass
+        device = None
+        if args:
+            device = args[0] if isinstance(args[0], (torch.device, str)) else None
+        elif 'device' in kwargs:
+            device = kwargs['device']
+        
+        if device and (isinstance(device, str) and 'cuda' in device.lower() or 
+                      (isinstance(device, torch.device) and device.type == 'cuda')):
+            # Don't move entire model to GPU - we'll handle it manually
+            logger.info("Skipping automatic GPU move to prevent OOM. Models will stay on CPU.")
+            return self
+        else:
+            # For CPU moves, allow default behavior
+            return super().to(*args, **kwargs)
 
     def infer_mert_ssl(self, target_wavs, wav_lengths):
         # Input is N x 2 x T (48kHz), convert to N x T (24kHz), mono
-        mert_input_wavs_mono_24k = self.resampler_mert(target_wavs.mean(dim=1))
+        # Ensure input is on CPU with float32 dtype for resampler
+        target_wavs_mono = target_wavs.mean(dim=1).cpu().float()
+        mert_input_wavs_mono_24k = self.resampler_mert(target_wavs_mono)
         bsz = target_wavs.shape[0]
         actual_lengths_24k = wav_lengths // 2  # 48kHz -> 24kHz
 
@@ -223,7 +297,9 @@ class Pipeline(LightningModule):
     def infer_mhubert_ssl(self, target_wavs, wav_lengths):
         # Step 1: Preprocess audio
         # Input: N x 2 x T (48kHz, stereo) -> N x T (16kHz, mono)
-        mhubert_input_wavs_mono_16k = self.resampler_mhubert(target_wavs.mean(dim=1))
+        # Ensure input is on CPU with float32 dtype for resampler
+        target_wavs_mono = target_wavs.mean(dim=1).cpu().float()
+        mhubert_input_wavs_mono_16k = self.resampler_mhubert(target_wavs_mono)
         bsz = target_wavs.shape[0]
         actual_lengths_16k = wav_lengths // 3  # Convert lengths from 48kHz to 16kHz
 
@@ -314,7 +390,7 @@ class Pipeline(LightningModule):
         return last_hidden_states, attention_mask
 
     def preprocess(self, batch, train=True):
-        target_wavs = batch["target_wavs"]
+        target_wavs = batch["target_wavs"].to(torch.float32)
         wav_lengths = batch["wav_lengths"]
 
         dtype = target_wavs.dtype
@@ -451,7 +527,7 @@ class Pipeline(LightningModule):
             self.train_dataset,
             shuffle=True,
             num_workers=self.hparams.num_workers,
-            pin_memory=True,
+            pin_memory=self.hparams.num_workers > 0,  # Only pin memory if using workers
             collate_fn=self.train_dataset.collate_fn,
         )
 
@@ -526,6 +602,14 @@ class Pipeline(LightningModule):
 
         # N x H -> N x c x W x H
         x = noisy_image
+        
+        # Move transformer to GPU temporarily for forward pass
+        # Only move if not already on GPU (to save memory)
+        transformer_device = next(self.transformers.parameters()).device
+        if transformer_device.type != 'cuda':
+            logger.debug("Moving transformer to GPU for forward pass...")
+            self.transformers = self.transformers.to(device)
+        
         # Step 5: Predict noise
         transformer_output = self.transformers(
             hidden_states=x,
@@ -538,6 +622,11 @@ class Pipeline(LightningModule):
             timestep=timesteps.to(device).to(dtype),
             ssl_hidden_states=all_ssl_hiden_states,
         )
+        
+        # Move transformer back to CPU to save memory (optional, can keep on GPU if enough memory)
+        # Uncomment if OOM occurs:
+        # self.transformers = self.transformers.cpu()
+        # torch.cuda.empty_cache()
         model_pred = transformer_output.sample
         proj_losses = transformer_output.proj_losses
 
@@ -553,6 +642,7 @@ class Pipeline(LightningModule):
             .unsqueeze(1)
             .expand(-1, target_image.shape[1], target_image.shape[2], -1)
         )
+        mask = mask.to(device=model_pred.device, dtype=model_pred.dtype)
 
         selected_model_pred = (model_pred * mask).reshape(bsz, -1).contiguous()
         selected_target = (target * mask).reshape(bsz, -1).contiguous()
@@ -776,11 +866,21 @@ class Pipeline(LightningModule):
 
     def plot_step(self, batch, batch_idx):
         global_step = self.global_step
+        local_rank = getattr(self, "local_rank", 0)
+
+        dist_rank = 0
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            dist_rank = torch.distributed.get_rank()
+
+        current_device = 0
+        if torch.cuda.is_available():
+            current_device = torch.cuda.current_device()
+
         if (
             global_step % self.hparams.every_plot_step != 0
-            or self.local_rank != 0
-            or torch.distributed.get_rank() != 0
-            or torch.cuda.current_device() != 0
+            or local_rank != 0
+            or dist_rank != 0
+            or current_device != 0
         ):
             return
         results = self.predict_step(batch)
@@ -839,13 +939,20 @@ def main(args):
         version=datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + args.exp_name,
         save_dir=args.logger_dir,
     )
+    # Use appropriate strategy for Windows (DDP not supported on Windows)
+    # For single GPU, use "auto" or None. For multi-GPU on Windows, use "ddp_spawn"
+    if args.devices == 1:
+        strategy = "auto"  # Lightning will choose appropriate strategy
+    else:
+        strategy = "ddp_spawn"  # Multi-GPU on Windows
+    
     trainer = Trainer(
         accelerator="gpu",
         devices=args.devices,
         num_nodes=args.num_nodes,
         precision=args.precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        strategy="ddp_find_unused_parameters_true",
+        strategy=strategy,
         max_epochs=args.epochs,
         max_steps=args.max_steps,
         log_every_n_steps=1,

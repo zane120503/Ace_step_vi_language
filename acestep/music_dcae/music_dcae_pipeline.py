@@ -43,7 +43,9 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if source_sample_rate is None:
             source_sample_rate = 48000
 
-        self.resampler = torchaudio.transforms.Resample(source_sample_rate, 44100)
+        self.resampler = torchaudio.transforms.Resample(
+            source_sample_rate, 44100, dtype=torch.float32
+        )
 
         self.transform = transforms.Compose(
             [
@@ -87,9 +89,25 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             sr = 48000
             resampler = self.resampler
         else:
-            resampler = torchaudio.transforms.Resample(sr, 44100).to(device).to(dtype)
+            resampler = torchaudio.transforms.Resample(sr, 44100, dtype=dtype)
 
+        # Bảo đảm resampler và audio cùng device/dtype để tránh lỗi conv1d
+        if resampler.kernel.device != device:
+            resampler = resampler.to(device)
+        if resampler.kernel.dtype != dtype:
+            try:
+                resampler = resampler.to(dtype=dtype)
+            except TypeError:
+                # Một số phiên bản torchaudio không hỗ trợ to(dtype=...), fallback cast audio về float32
+                dtype = torch.float32
+                audios = audios.float()
+                resampler = resampler.to(dtype=dtype)
+
+        audios = audios.to(device=device, dtype=dtype, non_blocking=True)
         audio = resampler(audios)
+
+        dcae_device = next(self.dcae.parameters()).device
+        audio = audio.to(device=dcae_device, dtype=torch.float32)
 
         max_audio_len = audio.shape[-1]
         if max_audio_len % (8 * 512) != 0:
@@ -98,6 +116,9 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             )
 
         mels = self.forward_mel(audio)
+        target_dtype = self.dcae.encoder.conv_in.weight.dtype
+        if mels.dtype != target_dtype or mels.device != dcae_device:
+            mels = mels.to(device=dcae_device, dtype=target_dtype)
         mels = (mels - self.min_mel_value) / (self.max_mel_value - self.min_mel_value)
         mels = self.transform(mels)
         latents = []
