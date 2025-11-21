@@ -2,6 +2,7 @@ import os
 import re
 import textwrap
 from functools import cached_property
+import unicodedata
 
 import pypinyin
 import torch
@@ -592,6 +593,17 @@ def basic_cleaners(text):
     return text
 
 
+def vietnamese_cleaners(text):
+    """Simple normalization for Vietnamese lyrics."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = unicodedata.normalize("NFC", text)
+    text = text.replace('"', "")
+    text = lowercase(text)
+    text = collapse_whitespace(text)
+    return text
+
+
 def chinese_transliterate(text):
     return "".join(
         [
@@ -644,6 +656,7 @@ class VoiceBpeTokenizer:
             "ja": 71,
             "hu": 224,
             "ko": 95,
+            "vi": 500,
         }
 
     @cached_property
@@ -688,6 +701,8 @@ class VoiceBpeTokenizer:
         elif lang == "hi":
             # @manmay will implement this
             txt = basic_cleaners(txt)
+        elif lang == "vi":
+            txt = vietnamese_cleaners(txt)
         else:
             raise NotImplementedError(f"Language '{lang}' is not supported.")
         return txt

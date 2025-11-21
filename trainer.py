@@ -15,7 +15,14 @@ from acestep.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from acestep.text2music_dataset import Text2MusicDataset
 from loguru import logger
-from transformers import AutoModel, Wav2Vec2FeatureExtractor
+from transformers import (
+    AutoModel,
+    AutoModelForSeq2SeqLM,
+    T5Tokenizer,
+    Wav2Vec2FeatureExtractor,
+    UMT5EncoderModel,
+    AutoTokenizer,
+)
 import torchaudio
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
     retrieve_timesteps,
@@ -26,6 +33,8 @@ from tqdm import tqdm
 import random
 import os
 import warnings
+import time
+import gc
 from acestep.pipeline_ace_step import ACEStepPipeline
 
 
@@ -36,6 +45,15 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision("high")
+
+# Note: PyTorch/CUDA on Windows with dedicated GPU cannot use "shared GPU memory"
+# Shared memory shown in Task Manager is just a display metric, not usable by PyTorch
+# We can only use dedicated VRAM (6GB on RTX 3050)
+# To work around this, we keep models on CPU and only move to GPU temporarily during forward pass
+if torch.cuda.is_available():
+    # Set memory fraction to use maximum dedicated VRAM
+    torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of dedicated VRAM to leave some buffer
+    logger.info("GPU memory management: Using dedicated VRAM only (shared memory not available for PyTorch)")
 
 
 class Pipeline(LightningModule):
@@ -64,15 +82,35 @@ class Pipeline(LightningModule):
         self.save_hyperparameters()
         self.is_train = train
         self.T = T
+        
+        # Track training time for ETA calculation
+        self.training_start_time = None
+        self.step_times = []
 
         # Initialize scheduler
         self.scheduler = self.get_scheduler()
 
         # step 1: load model
         logger.info("Initializing ACEStepPipeline...")
+        # Clear GPU cache before loading to avoid OOM
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Force garbage collection to free any lingering GPU memory
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info("GPU cache cleared before loading checkpoint")
+        
         acestep_pipeline = ACEStepPipeline(checkpoint_dir)
         logger.info("Loading ACE-Step checkpoint...")
-        acestep_pipeline.load_checkpoint(acestep_pipeline.checkpoint_dir)
+        # Temporarily set device to CPU to load checkpoint without OOM
+        original_device = acestep_pipeline.device
+        acestep_pipeline.device = torch.device("cpu")
+        try:
+            acestep_pipeline.load_checkpoint(acestep_pipeline.checkpoint_dir)
+        finally:
+            # Restore original device (but models will stay on CPU as per our design)
+            acestep_pipeline.device = original_device
         logger.info("ACE-Step checkpoint loaded successfully")
 
         # Clear GPU cache before converting models
@@ -122,11 +160,12 @@ class Pipeline(LightningModule):
 
         self.transformers = transformers
 
-        # Move DCAE to CPU first if on GPU
+        # Keep DCAE on CPU to avoid OOM, but move to GPU temporarily when needed
+        # DCAE encode/decode needs extra VRAM for activations, so keeping on CPU is safer
         try:
             dcae_device = next(acestep_pipeline.music_dcae.parameters()).device
             if dcae_device.type == 'cuda':
-                logger.info("Moving DCAE to CPU...")
+                logger.info("Moving DCAE to CPU to avoid OOM...")
                 acestep_pipeline.music_dcae = acestep_pipeline.music_dcae.cpu()
                 torch.cuda.empty_cache()
         except:
@@ -136,20 +175,54 @@ class Pipeline(LightningModule):
         self.dcae = acestep_pipeline.music_dcae.float()
         self.dcae.requires_grad_(False)
 
-        # Move text encoder to CPU first if on GPU
-        try:
-            text_device = next(acestep_pipeline.text_encoder_model.parameters()).device
-            if text_device.type == 'cuda':
-                logger.info("Moving text encoder to CPU...")
-                acestep_pipeline.text_encoder_model = acestep_pipeline.text_encoder_model.cpu()
-                torch.cuda.empty_cache()
-        except:
-            logger.info("Moving text encoder to CPU (device check failed)...")
-            acestep_pipeline.text_encoder_model = acestep_pipeline.text_encoder_model.cpu()
-            torch.cuda.empty_cache()
-        self.text_encoder_model = acestep_pipeline.text_encoder_model.float()
+        # Use UMT5 (same as original model) for compatibility
+        # UMT5 supports Vietnamese but needs proper preprocessing
+        logger.info("Loading UMT5 tokenizer and encoder (compatible with trained model)...")
+        # Use os module (imported at top level, line 34)
+        # Check if checkpoint_dir exists and build path
+        if checkpoint_dir:
+            text_encoder_checkpoint_path = os.path.join(checkpoint_dir, "umt5-base")
+        else:
+            text_encoder_checkpoint_path = None
+        if text_encoder_checkpoint_path and os.path.exists(text_encoder_checkpoint_path):
+            # Use checkpoint from local directory
+            self.text_tokenizer = AutoTokenizer.from_pretrained(
+                text_encoder_checkpoint_path
+            )
+            self.text_encoder_model = UMT5EncoderModel.from_pretrained(
+                text_encoder_checkpoint_path, torch_dtype=torch.float32
+            ).eval()
+        else:
+            # Fallback: try to use from acestep_pipeline if available
+            logger.warning("UMT5 checkpoint not found, trying to use from pipeline...")
+            # We'll load it from the pipeline's checkpoint path
+            # For now, use a compatible UMT5 model
+            try:
+                # Try to get from acestep_pipeline if it's already loaded
+                if hasattr(acestep_pipeline, 'text_encoder_model') and hasattr(acestep_pipeline, 'text_tokenizer'):
+                    self.text_encoder_model = acestep_pipeline.text_encoder_model.float()
+                    self.text_tokenizer = acestep_pipeline.text_tokenizer
+                    logger.info("Using UMT5 from acestep_pipeline")
+                else:
+                    # Last resort: use google/umt5-base (may need to download)
+                    logger.warning("Loading UMT5 from HuggingFace (google/umt5-base)...")
+                    self.text_tokenizer = AutoTokenizer.from_pretrained("google/umt5-base")
+                    self.text_encoder_model = UMT5EncoderModel.from_pretrained(
+                        "google/umt5-base", torch_dtype=torch.float32
+                    ).eval()
+            except Exception as e:
+                logger.error(f"Failed to load UMT5: {e}")
+                raise
+        
+        self.text_encoder_model.eval()
         self.text_encoder_model.requires_grad_(False)
-        self.text_tokenizer = acestep_pipeline.text_tokenizer
+        
+        # Keep text encoder on GPU to reduce RAM usage (112M ≈ 224MB VRAM)
+        # This is small enough to keep on GPU permanently
+        if torch.cuda.is_available():
+            logger.info("Keeping text encoder on GPU to reduce RAM usage...")
+            self.text_encoder_model = self.text_encoder_model.cuda()
+            torch.cuda.empty_cache()
 
         if self.is_train:
             self.transformers.train()
@@ -163,7 +236,7 @@ class Pipeline(LightningModule):
                 logger.info("MERT model loaded successfully")
             except:
                 import json
-                import os
+                # os is already imported at top level (line 34), no need to import again
 
                 mert_config_path = os.path.join(
                     os.path.expanduser("~"),
@@ -280,9 +353,15 @@ class Pipeline(LightningModule):
         all_chunks = torch.stack(all_chunks, dim=0)
 
         # Batch inference
+        # Move chunks to same device as model
+        model_device = next(self.mert_model.parameters()).device
+        all_chunks = all_chunks.to(model_device)
         with torch.no_grad():
             # Output shape: (total_chunks, seq_len, hidden_size)
             mert_ssl_hidden_states = self.mert_model(all_chunks).last_hidden_state
+        # Move back to CPU if needed
+        if model_device.type == 'cuda':
+            mert_ssl_hidden_states = mert_ssl_hidden_states.cpu()
 
         # Calculate the number of features for each chunk
         chunk_num_features = [(length + 319) // 320 for length in chunk_actual_lengths]
@@ -359,9 +438,15 @@ class Pipeline(LightningModule):
         all_chunks = torch.stack(all_chunks, dim=0)  # Shape: (total_chunks, chunk_size)
 
         # Step 6: Batch inference with MHubert model
+        # Move chunks to same device as model
+        model_device = next(self.hubert_model.parameters()).device
+        all_chunks = all_chunks.to(model_device)
         with torch.no_grad():
             mhubert_ssl_hidden_states = self.hubert_model(all_chunks).last_hidden_state
             # Shape: (total_chunks, seq_len, hidden_size)
+        # Move back to CPU if needed
+        if model_device.type == 'cuda':
+            mhubert_ssl_hidden_states = mhubert_ssl_hidden_states.cpu()
 
         # Step 7: Compute number of features per chunk (assuming model stride of 320)
         chunk_num_features = [(length + 319) // 320 for length in chunk_actual_lengths]
@@ -387,20 +472,55 @@ class Pipeline(LightningModule):
         return mhubert_ssl_hidden_states_list
 
     def get_text_embeddings(self, texts, device, text_max_length=256):
+        # Preprocess Vietnamese text: comprehensive normalization for UMT5
+        # UMT5 (Universal Multilingual T5) supports Vietnamese natively
+        # Key points:
+        # 1. Model was trained with UMT5 embeddings → must use UMT5 (not ViT5)
+        # 2. UMT5 tokenizer can handle Vietnamese diacritics (ă, â, ê, ô, ơ, ư, đ)
+        # 3. When you train with Vietnamese data, model learns Vietnamese pronunciation
+        # 4. Proper normalization ensures UMT5 tokenizes Vietnamese correctly
+        import unicodedata
+        import re
+        processed_texts = []
+        for text in texts:
+            # Step 1: Normalize Unicode to NFC (canonical composition)
+            # Critical for Vietnamese: ensures diacritics are properly combined
+            # Example: "ă" should be single character, not "a" + combining mark
+            text = unicodedata.normalize('NFC', text)
+            
+            # Step 2: Preserve Vietnamese diacritics - UMT5 needs them for correct tokenization
+            # Vietnamese: ă, â, ê, ô, ơ, ư, đ, and their uppercase variants
+            # UMT5 tokenizer will split Vietnamese words correctly if diacritics are preserved
+            
+            # Step 3: Normalize whitespace (keep single spaces between words)
+            text = re.sub(r'\s+', ' ', text).strip()
+            
+            # Step 4: Remove zero-width characters that might confuse tokenizer
+            text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)  # Zero-width spaces
+            
+            # Step 5: Keep original case - UMT5 is case-sensitive
+            # Model was trained with mixed case, so preserve case for semantic meaning
+            # Vietnamese proper nouns (names, places) should keep their case
+            
+            processed_texts.append(text)
+        
         inputs = self.text_tokenizer(
-            texts,
+            processed_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=text_max_length,
         )
-        inputs = {key: value.to(device) for key, value in inputs.items()}
-        if self.text_encoder_model.device != device:
-            self.text_encoder_model.to(device)
+        # Text encoder is kept on GPU, so move inputs to GPU
+        encoder_device = next(self.text_encoder_model.parameters()).device
+        inputs = {key: value.to(encoder_device) for key, value in inputs.items()}
         with torch.no_grad():
             outputs = self.text_encoder_model(**inputs)
             last_hidden_states = outputs.last_hidden_state
         attention_mask = inputs["attention_mask"]
+        # Move results to target device (usually GPU for training)
+        last_hidden_states = last_hidden_states.to(device)
+        attention_mask = attention_mask.to(device)
         return last_hidden_states, attention_mask
 
     def preprocess(self, batch, train=True):
@@ -415,10 +535,14 @@ class Pipeline(LightningModule):
         mert_ssl_hidden_states = None
         mhubert_ssl_hidden_states = None
         if train:
-            with torch.amp.autocast(device_type="cuda", dtype=dtype):
-                mert_ssl_hidden_states = self.infer_mert_ssl(target_wavs, wav_lengths)
+            # Force SSL inference on CPU to avoid GPU OOM
+            target_wavs_cpu = target_wavs.cpu()
+            wav_lengths_cpu = wav_lengths.cpu()
+
+            with torch.no_grad():
+                mert_ssl_hidden_states = self.infer_mert_ssl(target_wavs_cpu, wav_lengths_cpu)
                 mhubert_ssl_hidden_states = self.infer_mhubert_ssl(
-                    target_wavs, wav_lengths
+                    target_wavs_cpu, wav_lengths_cpu
                 )
 
         # 1: text embedding
@@ -428,7 +552,20 @@ class Pipeline(LightningModule):
         )
         encoder_text_hidden_states = encoder_text_hidden_states.to(dtype)
 
+        # DCAE encode: Keep on CPU to avoid OOM
+        # DCAE encode needs ~1.2GB VRAM for activations, which is too much when combined with text encoder
+        # So we keep DCAE on CPU (slightly slower but avoids OOM)
+        dcae_device = next(self.dcae.parameters()).device
+        # Ensure DCAE is on CPU
+        if dcae_device.type == 'cuda':
+            self.dcae = self.dcae.cpu()
+            torch.cuda.empty_cache()
+        # Move input to CPU if needed
+        if target_wavs.device.type == 'cuda':
+            target_wavs = target_wavs.cpu()
         target_latents, _ = self.dcae.encode(target_wavs, wav_lengths)
+        # Move latents back to target device
+        target_latents = target_latents.to(device)
         attention_mask = torch.ones(
             bs, target_latents.shape[-1], device=device, dtype=dtype
         )
@@ -576,6 +713,12 @@ class Pipeline(LightningModule):
         return timesteps
 
     def run_step(self, batch, batch_idx):
+        # Initialize training start time on first step
+        if self.training_start_time is None:
+            self.training_start_time = time.time()
+            logger.info(f"🚀 Training started. Target: {self.hparams.max_steps} steps")
+
+        step_start_time = time.time()
         self.plot_step(batch, batch_idx)
         (
             keys,
@@ -701,6 +844,47 @@ class Pipeline(LightningModule):
             )
         # with torch.autograd.detect_anomaly():
         #     self.manual_backward(loss)
+        
+        # Calculate and log training progress
+        step_end_time = time.time()
+        step_duration = step_end_time - step_start_time
+        self.step_times.append(step_duration)
+        
+        # Keep only last 50 step times for average calculation
+        if len(self.step_times) > 50:
+            self.step_times = self.step_times[-50:]
+        
+        current_step = self.global_step
+        max_steps = self.hparams.max_steps
+        
+        # Log progress every 10 steps (or first step) to avoid spam
+        if current_step % 10 == 0 or current_step == 1:
+            # Calculate statistics
+            avg_step_time = sum(self.step_times) / len(self.step_times) if self.step_times else step_duration
+            elapsed_time = step_end_time - self.training_start_time
+            remaining_steps = max(0, max_steps - current_step)
+            estimated_remaining_time = avg_step_time * remaining_steps
+            
+            # Format time helper
+            def format_time(seconds):
+                if seconds < 60:
+                    return f"{seconds:.1f}s"
+                elif seconds < 3600:
+                    return f"{seconds/60:.1f}m"
+                else:
+                    hours = int(seconds // 3600)
+                    minutes = int((seconds % 3600) // 60)
+                    return f"{hours}h {minutes}m"
+            
+            progress_pct = (current_step / max_steps * 100) if max_steps > 0 else 0
+            
+            logger.info(
+                f"📊 Step {current_step}/{max_steps} ({progress_pct:.1f}%) | "
+                f"Avg: {format_time(avg_step_time)}/step | "
+                f"Elapsed: {format_time(elapsed_time)} | "
+                f"ETA: {format_time(estimated_remaining_time)}"
+            )
+        
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -857,6 +1041,16 @@ class Pipeline(LightningModule):
         )
 
         audio_lengths = batch["wav_lengths"]
+        # DCAE decode: Keep on CPU to avoid OOM
+        # DCAE decode needs significant VRAM, so we keep it on CPU
+        dcae_device = next(self.dcae.parameters()).device
+        # Ensure DCAE is on CPU
+        if dcae_device.type == 'cuda':
+            self.dcae = self.dcae.cpu()
+            torch.cuda.empty_cache()
+        # Move latents to CPU if needed
+        if pred_latents.device.type == 'cuda':
+            pred_latents = pred_latents.cpu()
         sr, pred_wavs = self.dcae.decode(
             pred_latents, audio_lengths=audio_lengths, sr=48000
         )
