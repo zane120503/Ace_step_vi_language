@@ -232,9 +232,21 @@ class ACEStepPipeline:
         if self.torch_compile:
             self.text_encoder_model = torch.compile(self.text_encoder_model)
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            text_encoder_checkpoint_path
-        )
+        try:
+            self.text_tokenizer = AutoTokenizer.from_pretrained(
+                text_encoder_checkpoint_path,
+                use_fast=False,
+                trust_remote_code=True
+            )
+        except (AttributeError, ValueError, OSError) as e:
+            # Fallback: try loading from HuggingFace directly if local path fails
+            logger.warning(f"Failed to load tokenizer from {text_encoder_checkpoint_path}: {e}")
+            logger.info("Trying to load tokenizer from HuggingFace (google/umt5-base)...")
+            self.text_tokenizer = AutoTokenizer.from_pretrained(
+                "google/umt5-base",
+                use_fast=False,
+                trust_remote_code=True
+            )
         self.loaded = True
 
         # compile
@@ -317,9 +329,21 @@ class ACEStepPipeline:
         )
         self.text_encoder_model.torchao_quantized = True
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            text_encoder_checkpoint_path
-        )
+        try:
+            self.text_tokenizer = AutoTokenizer.from_pretrained(
+                text_encoder_checkpoint_path,
+                use_fast=False,
+                trust_remote_code=True
+            )
+        except (AttributeError, ValueError, OSError) as e:
+            # Fallback: try loading from HuggingFace directly if local path fails
+            logger.warning(f"Failed to load tokenizer from {text_encoder_checkpoint_path}: {e}")
+            logger.info("Trying to load tokenizer from HuggingFace (google/umt5-base)...")
+            self.text_tokenizer = AutoTokenizer.from_pretrained(
+                "google/umt5-base",
+                use_fast=False,
+                trust_remote_code=True
+            )
 
         lang_segment = LangSegment()
         lang_segment.setfilters(language_filters.default)
