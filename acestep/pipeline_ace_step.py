@@ -232,21 +232,27 @@ class ACEStepPipeline:
         if self.torch_compile:
             self.text_encoder_model = torch.compile(self.text_encoder_model)
 
+        # Always load tokenizer from HuggingFace as it's more reliable
+        # The tokenizer is usually the same and doesn't need to be from checkpoint
         try:
-            self.text_tokenizer = AutoTokenizer.from_pretrained(
-                text_encoder_checkpoint_path,
-                use_fast=False,
-                trust_remote_code=True
-            )
-        except (AttributeError, ValueError, OSError) as e:
-            # Fallback: try loading from HuggingFace directly if local path fails
-            logger.warning(f"Failed to load tokenizer from {text_encoder_checkpoint_path}: {e}")
-            logger.info("Trying to load tokenizer from HuggingFace (google/umt5-base)...")
+            logger.info("Loading tokenizer from HuggingFace (google/umt5-base)...")
             self.text_tokenizer = AutoTokenizer.from_pretrained(
                 "google/umt5-base",
                 use_fast=False,
                 trust_remote_code=True
             )
+        except Exception as e:
+            # Fallback: try loading from checkpoint path if HuggingFace fails
+            logger.warning(f"Failed to load tokenizer from HuggingFace: {e}")
+            logger.info(f"Trying to load tokenizer from checkpoint: {text_encoder_checkpoint_path}")
+            if os.path.exists(text_encoder_checkpoint_path):
+                self.text_tokenizer = AutoTokenizer.from_pretrained(
+                    text_encoder_checkpoint_path,
+                    use_fast=False,
+                    trust_remote_code=True
+                )
+            else:
+                raise RuntimeError(f"Failed to load tokenizer from both HuggingFace and checkpoint path: {text_encoder_checkpoint_path}")
         self.loaded = True
 
         # compile
@@ -329,21 +335,27 @@ class ACEStepPipeline:
         )
         self.text_encoder_model.torchao_quantized = True
 
+        # Always load tokenizer from HuggingFace as it's more reliable
+        # The tokenizer is usually the same and doesn't need to be from checkpoint
         try:
-            self.text_tokenizer = AutoTokenizer.from_pretrained(
-                text_encoder_checkpoint_path,
-                use_fast=False,
-                trust_remote_code=True
-            )
-        except (AttributeError, ValueError, OSError) as e:
-            # Fallback: try loading from HuggingFace directly if local path fails
-            logger.warning(f"Failed to load tokenizer from {text_encoder_checkpoint_path}: {e}")
-            logger.info("Trying to load tokenizer from HuggingFace (google/umt5-base)...")
+            logger.info("Loading tokenizer from HuggingFace (google/umt5-base)...")
             self.text_tokenizer = AutoTokenizer.from_pretrained(
                 "google/umt5-base",
                 use_fast=False,
                 trust_remote_code=True
             )
+        except Exception as e:
+            # Fallback: try loading from checkpoint path if HuggingFace fails
+            logger.warning(f"Failed to load tokenizer from HuggingFace: {e}")
+            logger.info(f"Trying to load tokenizer from checkpoint: {text_encoder_checkpoint_path}")
+            if os.path.exists(text_encoder_checkpoint_path):
+                self.text_tokenizer = AutoTokenizer.from_pretrained(
+                    text_encoder_checkpoint_path,
+                    use_fast=False,
+                    trust_remote_code=True
+                )
+            else:
+                raise RuntimeError(f"Failed to load tokenizer from both HuggingFace and checkpoint path: {text_encoder_checkpoint_path}")
 
         lang_segment = LangSegment()
         lang_segment.setfilters(language_filters.default)
