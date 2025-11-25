@@ -59,8 +59,9 @@ drive.mount('/content/drive')
 **Tạo cell mới và chạy:**
 
 ```python
-!git clone https://github.com/ace-step/ACE-Step.git
-%cd ACE-Step
+# Clone từ repository tiếng Việt (đã có config và dataset cho tiếng Việt)
+!git clone https://github.com/zane120503/Ace_step_vi_language.git
+%cd Ace_step_vi_language
 ```
 
 **Kết quả:**

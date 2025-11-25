@@ -15,8 +15,9 @@ drive.mount('/content/drive')
 # ============================================
 # CELL 2: Clone Repository
 # ============================================
-!git clone https://github.com/ace-step/ACE-Step.git
-%cd ACE-Step
+# Clone từ repository tiếng Việt (đã có config và dataset cho tiếng Việt)
+!git clone https://github.com/zane120503/Ace_step_vi_language.git
+%cd Ace_step_vi_language
 
 # ============================================
 # CELL 3: Cài đặt Dependencies
