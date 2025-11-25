@@ -86,6 +86,7 @@ class Pipeline(LightningModule):
         # Track training time for ETA calculation
         self.training_start_time = None
         self.step_times = []
+        self.batch_start_time = None  # Track batch start time (including data loading)
 
         # Initialize scheduler
         self.scheduler = self.get_scheduler()
@@ -713,11 +714,8 @@ class Pipeline(LightningModule):
         return timesteps
 
     def run_step(self, batch, batch_idx):
-        # Initialize training start time on first step
-        if self.training_start_time is None:
-            self.training_start_time = time.time()
-            logger.info(f"🚀 Training started. Target: {self.hparams.max_steps} steps")
-
+        # Note: step_start_time is no longer used here
+        # Time tracking is now done in on_train_batch_start/end hooks
         step_start_time = time.time()
         self.plot_step(batch, batch_idx)
         (
@@ -733,8 +731,10 @@ class Pipeline(LightningModule):
             mhubert_ssl_hidden_states,
         ) = self.preprocess(batch)
 
-        target_image = target_latents
-        device = target_image.device
+        # Transformer runs on CPU to avoid OOM, so ensure all tensors are on CPU
+        transformer_device = next(self.transformers.parameters()).device
+        target_image = target_latents.to(transformer_device)
+        device = transformer_device  # Use transformer's device (CPU)
         dtype = target_image.dtype
         # Step 1: Generate random noise, initialize settings
         noise = torch.randn_like(target_image, device=device)
@@ -757,15 +757,14 @@ class Pipeline(LightningModule):
         if mhubert_ssl_hidden_states is not None:
             all_ssl_hiden_states.append(mhubert_ssl_hidden_states)
 
-        # N x H -> N x c x W x H
-        x = noisy_image
-        
-        # Move transformer to GPU temporarily for forward pass
-        # Only move if not already on GPU (to save memory)
-        transformer_device = next(self.transformers.parameters()).device
-        if transformer_device.type != 'cuda':
-            logger.debug("Moving transformer to GPU for forward pass...")
-            self.transformers = self.transformers.to(device)
+        # Move all inputs to transformer's device (CPU)
+        x = noisy_image  # Already on CPU
+        attention_mask = attention_mask.to(device)
+        encoder_text_hidden_states = encoder_text_hidden_states.to(device)
+        text_attention_mask = text_attention_mask.to(device)
+        speaker_embds = speaker_embds.to(device)
+        lyric_token_ids = lyric_token_ids.to(device)
+        lyric_mask = lyric_mask.to(device)
         
         # Step 5: Predict noise
         transformer_output = self.transformers(
@@ -780,15 +779,12 @@ class Pipeline(LightningModule):
             ssl_hidden_states=all_ssl_hiden_states,
         )
         
-        # Move transformer back to CPU to save memory (optional, can keep on GPU if enough memory)
-        # Uncomment if OOM occurs:
-        # self.transformers = self.transformers.cpu()
-        # torch.cuda.empty_cache()
         model_pred = transformer_output.sample
         proj_losses = transformer_output.proj_losses
 
         # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
         # Preconditioning of the model outputs.
+        # All tensors are now on the same device (CPU)
         model_pred = model_pred * (-sigmas) + noisy_image
 
         # Compute loss. Only calculate loss where chunk_mask is 1 and there is no padding
@@ -845,48 +841,71 @@ class Pipeline(LightningModule):
         # with torch.autograd.detect_anomaly():
         #     self.manual_backward(loss)
         
-        # Calculate and log training progress
-        step_end_time = time.time()
-        step_duration = step_end_time - step_start_time
-        self.step_times.append(step_duration)
-        
-        # Keep only last 50 step times for average calculation
-        if len(self.step_times) > 50:
-            self.step_times = self.step_times[-50:]
-        
-        current_step = self.global_step
-        max_steps = self.hparams.max_steps
-        
-        # Log progress every 10 steps (or first step) to avoid spam
-        if current_step % 10 == 0 or current_step == 1:
-            # Calculate statistics
-            avg_step_time = sum(self.step_times) / len(self.step_times) if self.step_times else step_duration
-            elapsed_time = step_end_time - self.training_start_time
-            remaining_steps = max(0, max_steps - current_step)
-            estimated_remaining_time = avg_step_time * remaining_steps
-            
-            # Format time helper
-            def format_time(seconds):
-                if seconds < 60:
-                    return f"{seconds:.1f}s"
-                elif seconds < 3600:
-                    return f"{seconds/60:.1f}m"
-                else:
-                    hours = int(seconds // 3600)
-                    minutes = int((seconds % 3600) // 60)
-                    return f"{hours}h {minutes}m"
-            
-            progress_pct = (current_step / max_steps * 100) if max_steps > 0 else 0
-            
-            logger.info(
-                f"📊 Step {current_step}/{max_steps} ({progress_pct:.1f}%) | "
-                f"Avg: {format_time(avg_step_time)}/step | "
-                f"Elapsed: {format_time(elapsed_time)} | "
-                f"ETA: {format_time(estimated_remaining_time)}"
-            )
+        # Note: Time tracking and logging is now done in on_train_batch_end hook
+        # to include data loading time
         
         return loss
 
+    def on_train_batch_start(self, batch, batch_idx):
+        """Track batch start time (includes data loading time)"""
+        if self.batch_start_time is None:
+            # First batch - also initialize training start time
+            self.training_start_time = time.time()
+            logger.info(f"🚀 Training started. Target: {self.hparams.max_steps} steps")
+        self.batch_start_time = time.time()
+        return super().on_train_batch_start(batch, batch_idx)
+    
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Calculate actual step time including data loading"""
+        if self.batch_start_time is not None:
+            batch_end_time = time.time()
+            actual_step_duration = batch_end_time - self.batch_start_time
+            self.step_times.append(actual_step_duration)
+            
+            # Keep only last 50 step times for average calculation
+            if len(self.step_times) > 50:
+                self.step_times = self.step_times[-50:]
+            
+            # Log progress every 10 steps
+            current_step = self.global_step
+            if current_step % 10 == 0 or current_step == 1:
+                # Calculate statistics
+                recent_avg_step_time = sum(self.step_times) / len(self.step_times) if self.step_times else actual_step_duration
+                
+                # Overall average (from start)
+                if self.training_start_time is not None:
+                    elapsed_time = batch_end_time - self.training_start_time
+                    overall_avg_step_time = elapsed_time / current_step if current_step > 0 else actual_step_duration
+                else:
+                    elapsed_time = 0
+                    overall_avg_step_time = actual_step_duration
+                
+                remaining_steps = max(0, self.hparams.max_steps - current_step)
+                estimated_remaining_time = overall_avg_step_time * remaining_steps
+                
+                # Format time helper
+                def format_time(seconds):
+                    if seconds < 60:
+                        return f"{seconds:.1f}s"
+                    elif seconds < 3600:
+                        return f"{seconds/60:.1f}m"
+                    else:
+                        hours = int(seconds // 3600)
+                        minutes = int((seconds % 3600) // 60)
+                        return f"{hours}h {minutes}m"
+                
+                progress_pct = (current_step / self.hparams.max_steps * 100) if self.hparams.max_steps > 0 else 0
+                
+                logger.info(
+                    f"📊 Step {current_step}/{self.hparams.max_steps} ({progress_pct:.1f}%) | "
+                    f"Recent Avg: {format_time(recent_avg_step_time)}/step | "
+                    f"Overall Avg: {format_time(overall_avg_step_time)}/step | "
+                    f"Elapsed: {format_time(elapsed_time)} | "
+                    f"ETA: {format_time(estimated_remaining_time)} (based on overall avg)"
+                )
+        
+        return super().on_train_batch_end(outputs, batch, batch_idx)
+    
     def training_step(self, batch, batch_idx):
         return self.run_step(batch, batch_idx)
 

@@ -43,34 +43,64 @@ Write-Host ""
 Write-Host "[3/3] Bắt đầu training LoRA..." -ForegroundColor Green
 Write-Host "Tham số tối ưu cho RTX 3050 (6GB VRAM):" -ForegroundColor Yellow
 Write-Host "  - precision: 16 (FP16)" -ForegroundColor Yellow
-Write-Host "  - accumulate_grad_batches: 8" -ForegroundColor Yellow
+Write-Host "  - accumulate_grad_batches: 4" -ForegroundColor Yellow
 Write-Host "  - max_steps: 20000" -ForegroundColor Yellow
+Write-Host "  - checkpoint mỗi: 100 steps" -ForegroundColor Yellow
 Write-Host ""
 
 # Tạo thư mục output nếu chưa có
 New-Item -ItemType Directory -Force -Path "./exps/checkpoints/vi_lora" | Out-Null
 New-Item -ItemType Directory -Force -Path "./exps/logs/vi_lora" | Out-Null
 
+# Tự động tìm checkpoint mới nhất để resume (nếu có)
+$checkpointPath = $null
+$checkpointsDir = "./exps/logs/vi_lora/lightning_logs"
+if (Test-Path $checkpointsDir) {
+    $latestCheckpoint = Get-ChildItem -Path $checkpointsDir -Recurse -Filter "*.ckpt" | 
+        Sort-Object LastWriteTime -Descending | 
+        Select-Object -First 1
+    
+    if ($latestCheckpoint) {
+        $checkpointPath = $latestCheckpoint.FullName
+        Write-Host "✓ Tìm thấy checkpoint mới nhất để resume" -ForegroundColor Green
+        Write-Host "  Checkpoint: $checkpointPath" -ForegroundColor Yellow
+    } else {
+        Write-Host "ℹ Chưa có checkpoint, sẽ train từ đầu" -ForegroundColor Cyan
+    }
+} else {
+    Write-Host "ℹ Chưa có checkpoint, sẽ train từ đầu" -ForegroundColor Cyan
+}
+
 # Lệnh train
-python trainer.py `
-    --num_nodes 1 `
-    --devices 1 `
-    --dataset_path "./vi_lora_dataset" `
-    --exp_name "vi_lora_small" `
-    --lora_config_path "config/vi_lora_config.json" `
-    --learning_rate 1e-4 `
-    --accumulate_grad_batches 8 `
-    --precision 16 `
-    --num_workers 0 `
-    --max_steps 20000 `
-    --every_n_train_steps 500 `
-    --shift 3.0 `
-    --checkpoint_dir "./exps/checkpoints/vi_lora" `
-    --logger_dir "./exps/logs/vi_lora" `
-    --epochs -1 `
-    --every_plot_step 2000 `
-    --gradient_clip_val 0.5 `
-    --gradient_clip_algorithm "norm"
+$trainArgs = @(
+    "--num_nodes", "1",
+    "--devices", "1",
+    "--dataset_path", "./vi_lora_dataset",
+    "--exp_name", "vi_lora_small",
+    "--lora_config_path", "config/vi_lora_config.json",
+    "--learning_rate", "1e-4",
+    "--accumulate_grad_batches", "4",
+    "--precision", "16",
+    "--num_workers", "0",
+    "--max_steps", "20000",
+    "--every_n_train_steps", "100",
+    "--shift", "3.0",
+    "--checkpoint_dir", "./exps/checkpoints/vi_lora",
+    "--logger_dir", "./exps/logs/vi_lora",
+    "--epochs", "-1",
+    "--every_plot_step", "2000",
+    "--gradient_clip_val", "0.5",
+    "--gradient_clip_algorithm", "norm"
+)
+
+# Thêm --ckpt_path nếu có checkpoint
+if ($checkpointPath) {
+    $trainArgs += "--ckpt_path"
+    $trainArgs += $checkpointPath
+}
+
+# Chạy lệnh train
+& python trainer.py $trainArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
