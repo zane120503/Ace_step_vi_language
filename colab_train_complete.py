@@ -265,7 +265,7 @@ cmd = f"""python trainer.py \\
     --learning_rate 1e-4 \\
     --accumulate_grad_batches 4 \\
     --precision 16 \\
-    --num_workers 2 \\
+    --num_workers 1 \\
     --max_steps 20000 \\
     --every_n_train_steps 100 \\
     --shift 3.0 \\

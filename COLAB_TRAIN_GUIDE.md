@@ -72,7 +72,7 @@ os.makedirs("/content/drive/MyDrive/ace_step_outputs/logs", exist_ok=True)
     --precision 16 \
     --num_workers 2 \
     --max_steps 20000 \
-    --every_n_train_steps 500 \
+    --every_n_train_steps 50 \
     --shift 3.0 \
     --checkpoint_dir "/content/drive/MyDrive/ace_step_outputs/checkpoints" \
     --logger_dir "/content/drive/MyDrive/ace_step_outputs/logs" \
@@ -87,22 +87,43 @@ os.makedirs("/content/drive/MyDrive/ace_step_outputs/logs", exist_ok=True)
 ### 1. Runtime timeout
 - Colab free: ~12 giờ timeout
 - Colab Pro: ~24 giờ timeout
-- **Giải pháp**: Lưu checkpoint thường xuyên (mỗi 500 steps) và resume sau
+- **Giải pháp**: 
+  - Lưu checkpoint thường xuyên (mỗi 50 steps - đã set)
+  - Code tự động tìm và resume từ checkpoint mới nhất
+  - Checkpoint format: Chỉ lưu LoRA adapter (~10-50MB) → tiết kiệm disk space
+
+### 1.5. RAM Usage khi khởi tạo
+- **Colab free (12.7GB RAM)**: Code đã được tối ưu để load từng phần → có thể chạy được
+- **Khởi tạo mất 5-10 phút**: Code sẽ load từng model và clear RAM sau mỗi bước
+- **Nếu vẫn OOM**: Nâng cấp lên Colab Pro+ (50GB RAM) hoặc chờ code hoàn tất load
 
 ### 2. Resume từ checkpoint
+**Lưu ý**: Code sẽ tự động tìm và load LoRA checkpoint nếu có, không cần `--ckpt_path`
+
 ```python
-# Tìm checkpoint mới nhất
+# Kiểm tra checkpoint có tồn tại không (optional)
 import glob
-checkpoints = glob.glob("/content/drive/MyDrive/ace_step_outputs/logs/vi_lora/lightning_logs/*/checkpoints/*.ckpt")
-latest_checkpoint = max(checkpoints, key=os.path.getctime) if checkpoints else None
+import os
 
-# Thêm --ckpt_path nếu có checkpoint
-ckpt_arg = f"--ckpt_path {latest_checkpoint}" if latest_checkpoint else ""
+log_dir = "/content/drive/MyDrive/ace_step_outputs/logs/vi_lora/lightning_logs"
+lora_checkpoints = glob.glob(f"{log_dir}/*/checkpoints/*_lora/pytorch_lora_weights.safetensors")
 
+if lora_checkpoints:
+    latest = max(lora_checkpoints, key=os.path.getctime)
+    print(f"✓ Tìm thấy LoRA checkpoint: {os.path.dirname(latest)}")
+    print("  Code sẽ tự động load khi training")
+else:
+    print("ℹ Chưa có checkpoint, sẽ train từ đầu")
+
+# Chạy training (code tự động resume nếu có checkpoint)
 !python trainer.py \
-    ... (các tham số khác) ... \
-    {ckpt_arg}
+    ... (các tham số khác) ...
 ```
+
+**Checkpoint format mới:**
+- Chỉ lưu LoRA adapter weights (`.safetensors`)
+- Không lưu full Lightning checkpoint (`.ckpt`)
+- File size: ~10-50MB mỗi checkpoint
 
 ### 3. Tối ưu cho Colab GPU
 - **T4 (16GB)**: Dùng `--accumulate_grad_batches 4`, `--precision 16`
@@ -110,8 +131,11 @@ ckpt_arg = f"--ckpt_path {latest_checkpoint}" if latest_checkpoint else ""
 - **A100 (40GB)**: Có thể tăng batch size và giảm `accumulate_grad_batches`
 
 ### 4. Lưu checkpoint lên Drive
-- Checkpoint tự động lưu vào `--checkpoint_dir` (đã set là Google Drive)
+- **Checkpoint format**: Chỉ lưu LoRA adapter weights (`.safetensors`), không lưu full model
+- Checkpoint tự động lưu vào `--logger_dir/.../checkpoints/epoch=X-step=Y_lora/`
+- **File size**: ~10-50MB mỗi checkpoint (rất nhỏ so với full model checkpoint ~GB)
 - Nên backup checkpoint quan trọng vào folder riêng
+- **Để sử dụng**: Load vào pipeline bằng `pipeline.load_lora(checkpoint_dir, lora_weight=1.0)`
 
 ### 5. Monitor training
 ```python
@@ -138,13 +162,22 @@ ckpt_arg = f"--ckpt_path {latest_checkpoint}" if latest_checkpoint else ""
 
 ## 🔧 Troubleshooting
 
-### Lỗi: Out of Memory
+### Lỗi: Out of Memory khi khởi tạo
+- **Nguyên nhân**: Model 3.3B params cần ~13GB RAM khi load
+- **Giải pháp**:
+  1. Code đã tối ưu để load từng phần → chờ 5-10 phút để hoàn tất
+  2. Nếu vẫn OOM: Nâng cấp lên **Colab Pro+** (50GB RAM)
+  3. Hoặc train trên máy local (RTX 3050) như hiện tại
+
+### Lỗi: Out of Memory khi training
 - Giảm `--accumulate_grad_batches` xuống 2 hoặc 1
 - Giảm `--num_workers` xuống 0
+- Giảm `--precision` từ `16` xuống `16-mixed` (nếu có)
 
 ### Lỗi: Runtime disconnected
-- Resume từ checkpoint mới nhất
-- Tăng tần suất lưu checkpoint (`--every_n_train_steps 200`)
+- Code tự động lưu checkpoint mỗi 50 steps
+- Resume bằng cách chạy lại cell training (code tự động tìm checkpoint mới nhất)
+- Không cần `--ckpt_path` vì chỉ train LoRA adapter
 
 ### Lỗi: Drive quota full
 - Xóa checkpoint cũ

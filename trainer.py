@@ -32,6 +32,7 @@ from acestep.apg_guidance import apg_forward, MomentumBuffer
 from tqdm import tqdm
 import random
 import os
+import glob
 import warnings
 import time
 import gc
@@ -61,6 +62,7 @@ class Pipeline(LightningModule):
         self,
         learning_rate: float = 1e-4,
         num_workers: int = 4,
+        batch_size: int = 1,
         train: bool = True,
         T: int = 1000,
         weight_decay: float = 1e-2,
@@ -76,6 +78,10 @@ class Pipeline(LightningModule):
         dataset_path: str = "./data/your_dataset_path",
         lora_config_path: str = None,
         adapter_name: str = "lora_adapter",
+        grad_stats_interval: int = 0,
+        activation_stats_interval: int = 0,
+        every_n_train_steps: int = 100,
+        lora_checkpoint_dir: str = None,  # Đường dẫn đến LoRA checkpoint để resume
     ):
         super().__init__()
 
@@ -114,7 +120,9 @@ class Pipeline(LightningModule):
             acestep_pipeline.device = original_device
         logger.info("ACE-Step checkpoint loaded successfully")
 
-        # Clear GPU cache before converting models
+        # Clear RAM sau khi load base model (Option 2: Load từng phần)
+        logger.info("Clearing RAM after loading base model...")
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logger.info("GPU cache cleared")
@@ -128,8 +136,9 @@ class Pipeline(LightningModule):
                 logger.warning(f"GPU has compute capability sm_{gpu_capability[0]}{gpu_capability[1]} which is very new. "
                              "PyTorch may show warnings, but GPU should still work.")
 
+        # Step 1: Prepare transformer base model (không convert ngay)
         logger.info("Preparing transformer for LoRA...")
-        # Move to CPU first, then convert to float to avoid OOM
+        # Move to CPU first to avoid OOM
         try:
             model_device = next(acestep_pipeline.ace_step_transformer.parameters()).device
             if model_device.type == 'cuda':
@@ -141,9 +150,22 @@ class Pipeline(LightningModule):
             logger.info("Moving transformer to CPU (device check failed)...")
             acestep_pipeline.ace_step_transformer = acestep_pipeline.ace_step_transformer.cpu()
             torch.cuda.empty_cache()
+        
+        # Clear RAM trước khi convert
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Convert sang float32 (có thể tốn RAM, nhưng cần cho training ổn định)
+        logger.info("Converting transformer to float32...")
         transformers = acestep_pipeline.ace_step_transformer.float()
         transformers.enable_gradient_checkpointing()
+        
+        # Clear RAM sau khi convert
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        logger.info("Transformer converted and gradient checkpointing enabled")
 
+        # Step 2: Load LoRA adapter (sau khi đã clear RAM)
         assert lora_config_path is not None, "Please provide a LoRA config path"
         if lora_config_path is not None:
             logger.info(f"Loading LoRA config from {lora_config_path}...")
@@ -158,9 +180,35 @@ class Pipeline(LightningModule):
             transformers.add_adapter(adapter_config=lora_config, adapter_name=adapter_name)
             self.adapter_name = adapter_name
             logger.info("LoRA adapter added successfully")
+            
+            # Load LoRA checkpoint nếu có (để resume training)
+            if lora_checkpoint_dir and os.path.exists(lora_checkpoint_dir):
+                lora_weights_path = os.path.join(lora_checkpoint_dir, "pytorch_lora_weights.safetensors")
+                if os.path.exists(lora_weights_path):
+                    logger.info(f"Resuming from LoRA checkpoint: {lora_checkpoint_dir}")
+                    try:
+                        transformers.load_lora_adapter(
+                            lora_weights_path,
+                            adapter_name=adapter_name,
+                            with_alpha=True,
+                            prefix=None
+                        )
+                        logger.info(f"✓ LoRA checkpoint loaded successfully from {lora_checkpoint_dir}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Không thể load LoRA checkpoint: {e}. Sẽ train từ đầu.")
+                else:
+                    logger.warning(f"⚠️ LoRA checkpoint directory tồn tại nhưng không tìm thấy pytorch_lora_weights.safetensors: {lora_checkpoint_dir}")
+            else:
+                logger.info("ℹ Không có LoRA checkpoint để resume, sẽ train từ đầu")
+            
+            # Clear RAM sau khi add adapter
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         self.transformers = transformers
 
+        # Step 3: Load DCAE (sau khi đã clear RAM từ transformer)
+        logger.info("Loading DCAE model...")
         # Keep DCAE on CPU to avoid OOM, but move to GPU temporarily when needed
         # DCAE encode/decode needs extra VRAM for activations, so keeping on CPU is safer
         try:
@@ -175,7 +223,13 @@ class Pipeline(LightningModule):
             torch.cuda.empty_cache()
         self.dcae = acestep_pipeline.music_dcae.float()
         self.dcae.requires_grad_(False)
+        
+        # Clear RAM sau khi load DCAE
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        logger.info("DCAE loaded successfully")
 
+        # Step 4: Load UMT5 (sau khi đã clear RAM từ DCAE)
         # Use UMT5 (same as original model) for compatibility
         # UMT5 supports Vietnamese but needs proper preprocessing
         logger.info("Loading UMT5 tokenizer and encoder (compatible with trained model)...")
@@ -224,11 +278,19 @@ class Pipeline(LightningModule):
             logger.info("Keeping text encoder on GPU to reduce RAM usage...")
             self.text_encoder_model = self.text_encoder_model.cuda()
             torch.cuda.empty_cache()
+        
+        # Clear RAM sau khi load UMT5
+        gc.collect()
+        logger.info("UMT5 loaded successfully")
 
         if self.is_train:
             self.transformers.train()
 
-            # download first
+            # Step 5: Load SSL models (MERT và mHuBERT) - delay load để tiết kiệm RAM
+            # Clear RAM trước khi load SSL models
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
             logger.info("Loading MERT model...")
             try:
                 self.mert_model = AutoModel.from_pretrained(
@@ -265,6 +327,10 @@ class Pipeline(LightningModule):
                 "m-a-p/MERT-v1-330M", trust_remote_code=True
             )
             logger.info("MERT processor loaded successfully")
+            
+            # Clear RAM sau khi load MERT
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
             logger.info("Loading mHuBERT model...")
             self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
@@ -278,6 +344,10 @@ class Pipeline(LightningModule):
                 cache_dir=checkpoint_dir,
             )
             logger.info("mHuBERT processor loaded successfully")
+            
+            # Clear RAM sau khi load tất cả SSL models
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
             logger.info("All SSL models loaded. Initialization complete.")
 
             self.ssl_coeff = ssl_coeff
@@ -677,6 +747,7 @@ class Pipeline(LightningModule):
         )
         return DataLoader(
             self.train_dataset,
+            batch_size=self.hparams.batch_size,
             shuffle=True,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.num_workers > 0,  # Only pin memory if using workers
@@ -844,7 +915,56 @@ class Pipeline(LightningModule):
         # Note: Time tracking and logging is now done in on_train_batch_end hook
         # to include data loading time
         
+        if (
+            getattr(self.hparams, "activation_stats_interval", 0) > 0
+            and (self.global_step % self.hparams.activation_stats_interval) == 0
+        ):
+            self._log_activation_stats(
+                model_pred=model_pred,
+                noisy_image=noisy_image,
+                target_image=target_image,
+                loss=loss,
+            )
+
         return loss
+
+    def _collect_tensor_stats(self, tensor):
+        tensor_detached = tensor.detach().float().cpu()
+        return {
+            "mean": tensor_detached.mean().item(),
+            "std": tensor_detached.std(unbiased=False).item(),
+            "min": tensor_detached.min().item(),
+            "max": tensor_detached.max().item(),
+        }
+
+    def _log_activation_stats(self, **tensors):
+        stats = {}
+        for name, tensor in tensors.items():
+            if tensor is None:
+                continue
+            try:
+                tensor_stats = self._collect_tensor_stats(tensor)
+                for stat_key, stat_value in tensor_stats.items():
+                    full_key = f"debug/{name}_{stat_key}"
+                    self.log(
+                        full_key,
+                        stat_value,
+                        on_step=True,
+                        on_epoch=False,
+                        prog_bar=False,
+                    )
+                stats[name] = tensor_stats
+            except Exception as exc:
+                logger.warning(f"Không thể log thống kê cho {name}: {exc}")
+
+        if stats:
+            summary_parts = []
+            for name, tensor_stats in stats.items():
+                summary_parts.append(
+                    f"{name}: mean={tensor_stats['mean']:.4f}, std={tensor_stats['std']:.4f}, "
+                    f"min={tensor_stats['min']:.4f}, max={tensor_stats['max']:.4f}"
+                )
+            logger.info(f"🔍 Activation stats | step={self.global_step} | " + " | ".join(summary_parts))
 
     def on_train_batch_start(self, batch, batch_idx):
         """Track batch start time (includes data loading time)"""
@@ -903,11 +1023,75 @@ class Pipeline(LightningModule):
                     f"Elapsed: {format_time(elapsed_time)} | "
                     f"ETA: {format_time(estimated_remaining_time)} (based on overall avg)"
                 )
+            
+            # Tự lưu LoRA adapter mỗi N steps (thay vì dùng ModelCheckpoint để tránh MemoryError)
+            every_n_steps = getattr(self.hparams, "every_n_train_steps", 100)
+            if every_n_steps > 0 and current_step > 0 and current_step % every_n_steps == 0:
+                try:
+                    log_dir = self.logger.log_dir
+                    checkpoint_name = f"epoch={self.current_epoch}-step={current_step}_lora"
+                    checkpoint_dir = os.path.join(log_dir, "checkpoints", checkpoint_name)
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    self.transformers.save_lora_adapter(checkpoint_dir, adapter_name=self.adapter_name)
+                    logger.info(f"💾 Đã lưu LoRA adapter tại: {checkpoint_dir}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Không thể lưu LoRA adapter: {e}")
         
         return super().on_train_batch_end(outputs, batch, batch_idx)
     
     def training_step(self, batch, batch_idx):
         return self.run_step(batch, batch_idx)
+
+    def on_after_backward(self):
+        super().on_after_backward()
+        interval = getattr(self.hparams, "grad_stats_interval", 0)
+        if interval <= 0:
+            return
+        if (self.global_step % interval) != 0:
+            return
+
+        grad_norm_sq = 0.0
+        max_abs_grad = 0.0
+        tracked_params = 0
+
+        for name, param in self.transformers.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            grad = param.grad.detach()
+            param_norm = grad.norm(2).item()
+            grad_norm_sq += param_norm ** 2
+            max_abs_grad = max(max_abs_grad, grad.abs().max().item())
+            tracked_params += 1
+
+        if tracked_params == 0:
+            return
+
+        total_norm = grad_norm_sq ** 0.5
+        self.log(
+            "debug/grad_total_norm",
+            total_norm,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+        )
+        self.log(
+            "debug/grad_max_abs",
+            max_abs_grad,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+        )
+        self.log(
+            "debug/grad_tracked_params",
+            float(tracked_params),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+        )
+        logger.info(
+            f"🔍 Grad stats | step={self.global_step} | "
+            f"total_norm={total_norm:.4f} | max_abs={max_abs_grad:.4f} | params={tracked_params}"
+        )
 
     def on_save_checkpoint(self, checkpoint):
         state = {}
@@ -1145,22 +1329,40 @@ class Pipeline(LightningModule):
 
 
 def main(args):
+    # Tự động tìm LoRA checkpoint mới nhất nếu không có ckpt_path và không có lora_checkpoint_dir
+    lora_checkpoint_dir = args.lora_checkpoint_dir
+    if not lora_checkpoint_dir and not args.ckpt_path:
+        # Tìm LoRA checkpoint mới nhất trong logger_dir
+        log_dir = args.logger_dir
+        if os.path.exists(log_dir):
+            lora_checkpoints = glob.glob(
+                os.path.join(log_dir, "**", "checkpoints", "*_lora", "pytorch_lora_weights.safetensors"),
+                recursive=True
+            )
+            if lora_checkpoints:
+                latest_checkpoint = max(lora_checkpoints, key=os.path.getctime)
+                lora_checkpoint_dir = os.path.dirname(latest_checkpoint)
+                logger.info(f"✓ Tự động tìm thấy LoRA checkpoint mới nhất: {lora_checkpoint_dir}")
+    
     model = Pipeline(
         learning_rate=args.learning_rate,
         num_workers=args.num_workers,
+        batch_size=args.batch_size,
         shift=args.shift,
         max_steps=args.max_steps,
         every_plot_step=args.every_plot_step,
         dataset_path=args.dataset_path,
         checkpoint_dir=args.checkpoint_dir,
         adapter_name=args.exp_name,
-        lora_config_path=args.lora_config_path
-    )
-    checkpoint_callback = ModelCheckpoint(
-        monitor=None,
+        lora_config_path=args.lora_config_path,
+        grad_stats_interval=args.grad_stats_interval,
+        activation_stats_interval=args.activation_stats_interval,
         every_n_train_steps=args.every_n_train_steps,
-        save_top_k=-1,
+        lora_checkpoint_dir=lora_checkpoint_dir,
     )
+    # Tắt ModelCheckpoint để tránh MemoryError khi lưu full checkpoint
+    # Thay vào đó, LoRA adapter sẽ được lưu tự động trong hook on_train_batch_end
+    checkpoint_callback = None
     # add datetime str to version
     logger_callback = TensorBoardLogger(
         version=datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + args.exp_name,
@@ -1173,8 +1375,15 @@ def main(args):
     else:
         strategy = "ddp_spawn"  # Multi-GPU on Windows
     
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+
+    # Chỉ thêm checkpoint_callback nếu không None
+    callbacks_list = []
+    if checkpoint_callback is not None:
+        callbacks_list.append(checkpoint_callback)
+    
     trainer = Trainer(
-        accelerator="gpu",
+        accelerator=accelerator,
         devices=args.devices,
         num_nodes=args.num_nodes,
         precision=args.precision,
@@ -1184,11 +1393,12 @@ def main(args):
         max_steps=args.max_steps,
         log_every_n_steps=1,
         logger=logger_callback,
-        callbacks=[checkpoint_callback],
+        callbacks=callbacks_list,
         gradient_clip_val=args.gradient_clip_val,
         gradient_clip_algorithm=args.gradient_clip_algorithm,
         reload_dataloaders_every_n_epochs=args.reload_dataloaders_every_n_epochs,
         val_check_interval=args.val_check_interval,
+        detect_anomaly=args.detect_anomaly,
     )
 
     trainer.fit(
@@ -1198,27 +1408,47 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = argparse.ArgumentParser()
-    args.add_argument("--num_nodes", type=int, default=1)
-    args.add_argument("--shift", type=float, default=3.0)
-    args.add_argument("--learning_rate", type=float, default=1e-4)
-    args.add_argument("--num_workers", type=int, default=8)
-    args.add_argument("--epochs", type=int, default=-1)
-    args.add_argument("--max_steps", type=int, default=2000000)
-    args.add_argument("--every_n_train_steps", type=int, default=2000)
-    args.add_argument("--dataset_path", type=str, default="./zh_lora_dataset")
-    args.add_argument("--exp_name", type=str, default="chinese_rap_lora")
-    args.add_argument("--precision", type=str, default="32")
-    args.add_argument("--accumulate_grad_batches", type=int, default=1)
-    args.add_argument("--devices", type=int, default=1)
-    args.add_argument("--logger_dir", type=str, default="./exps/logs/")
-    args.add_argument("--ckpt_path", type=str, default=None)
-    args.add_argument("--checkpoint_dir", type=str, default=None)
-    args.add_argument("--gradient_clip_val", type=float, default=0.5)
-    args.add_argument("--gradient_clip_algorithm", type=str, default="norm")
-    args.add_argument("--reload_dataloaders_every_n_epochs", type=int, default=1)
-    args.add_argument("--every_plot_step", type=int, default=2000)
-    args.add_argument("--val_check_interval", type=int, default=None)
-    args.add_argument("--lora_config_path", type=str, default="config/zh_rap_lora_config.json")
-    args = args.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_nodes", type=int, default=1)
+    parser.add_argument("--shift", type=float, default=3.0)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=-1)
+    parser.add_argument("--max_steps", type=int, default=2000000)
+    parser.add_argument("--every_n_train_steps", type=int, default=2000)
+    parser.add_argument("--dataset_path", type=str, default="./zh_lora_dataset")
+    parser.add_argument("--exp_name", type=str, default="chinese_rap_lora")
+    parser.add_argument("--precision", type=str, default="32")
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1)
+    parser.add_argument("--devices", type=int, default=1)
+    parser.add_argument("--logger_dir", type=str, default="./exps/logs/")
+    parser.add_argument("--ckpt_path", type=str, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument("--lora_checkpoint_dir", type=str, default=None, 
+                        help="Đường dẫn đến LoRA checkpoint để resume training (thư mục chứa pytorch_lora_weights.safetensors)")
+    parser.add_argument("--gradient_clip_val", type=float, default=0.5)
+    parser.add_argument("--gradient_clip_algorithm", type=str, default="norm")
+    parser.add_argument("--reload_dataloaders_every_n_epochs", type=int, default=1)
+    parser.add_argument("--every_plot_step", type=int, default=2000)
+    parser.add_argument("--val_check_interval", type=int, default=None)
+    parser.add_argument("--lora_config_path", type=str, default="config/zh_rap_lora_config.json")
+    parser.add_argument(
+        "--detect_anomaly",
+        action="store_true",
+        help="Bật torch.autograd.detect_anomaly để lần vết NaN/Inf",
+    )
+    parser.add_argument(
+        "--grad_stats_interval",
+        type=int,
+        default=0,
+        help="Log thống kê gradient mỗi N bước (0 = tắt)",
+    )
+    parser.add_argument(
+        "--activation_stats_interval",
+        type=int,
+        default=0,
+        help="Log thống kê activation mỗi N bước (0 = tắt)",
+    )
+    args = parser.parse_args()
     main(args)

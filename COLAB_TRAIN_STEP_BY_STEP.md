@@ -224,12 +224,14 @@ print(f"✓ Đã tạo thư mục log: {log_dir}")
 
 ---
 
-## 🚀 BƯỚC 8: Kiểm tra GPU
+## 🚀 BƯỚC 8: Kiểm tra GPU và RAM
 
 **Tạo cell mới và chạy:**
 
 ```python
 import torch
+import psutil
+import os
 
 print("🔍 Kiểm tra GPU...")
 if torch.cuda.is_available():
@@ -245,12 +247,27 @@ else:
     print("   Vui lòng chọn Runtime → Change runtime type → GPU")
     print("   Sau đó restart runtime và chạy lại cell này")
     gpu_ok = False
+
+print("\n🔍 Kiểm tra System RAM...")
+ram_total = psutil.virtual_memory().total / (1024**3)
+ram_available = psutil.virtual_memory().available / (1024**3)
+ram_used = psutil.virtual_memory().used / (1024**3)
+print(f"✓ Total RAM: {ram_total:.2f} GB")
+print(f"✓ Available RAM: {ram_available:.2f} GB")
+print(f"✓ Used RAM: {ram_used:.2f} GB")
+
+if ram_total < 20:
+    print("⚠️  RAM hơi thấp (<20GB), code đã được tối ưu để load từng phần")
+    print("   Khởi tạo có thể mất 5-10 phút nhưng vẫn chạy được")
+else:
+    print("✓ RAM đủ để training")
 ```
 
 **Kết quả mong đợi:**
 - ✓ GPU tìm thấy: Tesla T4 (hoặc V100/A100)
 - ✓ VRAM: 16.00 GB (hoặc tương ứng)
 - ✓ CUDA available: True
+- ✓ Total RAM: 12.7 GB (Colab free) hoặc 25-50GB (Colab Pro/Pro+)
 
 ---
 
@@ -262,23 +279,34 @@ else:
 import glob
 import os
 
-# Tìm checkpoint mới nhất (nếu có)
+# Tìm LoRA adapter checkpoint mới nhất (nếu có)
+# Checkpoint format: epoch=X-step=Y_lora/pytorch_lora_weights.safetensors
 log_dir = "/content/drive/MyDrive/ace_step_outputs/logs/vi_lora/lightning_logs"
-checkpoints = glob.glob(f"{log_dir}/*/checkpoints/*.ckpt") if os.path.exists(log_dir) else []
+lora_checkpoints = glob.glob(f"{log_dir}/*/checkpoints/*_lora/pytorch_lora_weights.safetensors") if os.path.exists(log_dir) else []
 
-if checkpoints:
-    latest_checkpoint = max(checkpoints, key=os.path.getctime)
-    print(f"✓ Tìm thấy checkpoint mới nhất: {latest_checkpoint}")
-    print(f"  Sẽ resume từ checkpoint này")
-    ckpt_path = latest_checkpoint
+if lora_checkpoints:
+    latest_checkpoint = max(lora_checkpoints, key=os.path.getctime)
+    checkpoint_dir = os.path.dirname(latest_checkpoint)  # Lấy thư mục chứa safetensors
+    print(f"✓ Tìm thấy LoRA checkpoint mới nhất: {checkpoint_dir}")
+    print(f"  File: {os.path.basename(latest_checkpoint)}")
+    print(f"  Sẽ load LoRA weights từ checkpoint này khi training")
+    # Lưu checkpoint_dir để dùng sau (nếu cần load manual)
+    lora_checkpoint_dir = checkpoint_dir
 else:
     print("ℹ Chưa có checkpoint, sẽ train từ đầu")
-    ckpt_path = None
+    lora_checkpoint_dir = None
+
+# Lưu ý: Code sẽ tự động resume từ checkpoint nếu có
+# Không cần truyền --ckpt_path vì chỉ train LoRA adapter
 ```
 
 **Kết quả:**
-- Nếu có checkpoint: ✓ Tìm thấy checkpoint mới nhất: ...
+- Nếu có checkpoint: ✓ Tìm thấy LoRA checkpoint mới nhất: ...
 - Nếu chưa có: ℹ Chưa có checkpoint, sẽ train từ đầu
+
+**Lưu ý:**
+- Checkpoint format mới: Chỉ lưu LoRA adapter weights (`.safetensors`), không lưu full Lightning checkpoint
+- Để resume training, code sẽ tự động load LoRA weights nếu tìm thấy trong thư mục checkpoints
 
 ---
 
@@ -342,7 +370,7 @@ cmd = f"""python trainer.py \\
     --precision 16 \\
     --num_workers 2 \\
     --max_steps 20000 \\
-    --every_n_train_steps 100 \\
+    --every_n_train_steps 50 \\
     --shift 3.0 \\
     --checkpoint_dir "{checkpoint_dir}" \\
     --logger_dir "{log_dir}" \\
@@ -351,9 +379,8 @@ cmd = f"""python trainer.py \\
     --gradient_clip_val 0.5 \\
     --gradient_clip_algorithm "norm" """
 
-# Thêm --ckpt_path nếu có checkpoint
-if 'ckpt_path' in locals() and ckpt_path:
-    cmd += f'\\\n    --ckpt_path "{ckpt_path}"'
+# Lưu ý: Code sẽ tự động tìm và load LoRA checkpoint nếu có
+# Không cần --ckpt_path vì chỉ train LoRA adapter (không phải full model checkpoint)
 
 print("🚀 Bắt đầu training...")
 print("=" * 60)
@@ -366,19 +393,47 @@ print("=" * 60)
 
 **Lưu ý:**
 - Training sẽ chạy và hiển thị log
-- Có thể mất vài phút để khởi động
-- Checkpoint sẽ được lưu mỗi 100 steps
+- **Khởi tạo có thể mất 5-10 phút** do code đã được tối ưu để load từng phần (giảm RAM usage)
+- Code sẽ tự động clear RAM sau mỗi bước load model → phù hợp với Colab free (12.7GB RAM)
+- Checkpoint (LoRA adapter) sẽ được lưu mỗi **50 steps** vào thư mục `checkpoints/epoch=X-step=Y_lora/`
+- **Checkpoint format**: Chỉ lưu LoRA weights (`.safetensors`), không lưu full model → tiết kiệm disk space
 - Dataset path sẽ tự động sử dụng đường dẫn đã tìm thấy ở Bước 6
 
 ---
 
 ## 📊 BƯỚC 11: Monitor Training (Optional)
 
+### Monitor RAM Usage
+
+**Tạo cell mới và chạy (để theo dõi RAM trong quá trình training):**
+
+```python
+# Monitor RAM usage (chạy cell này trong tab mới để không block training)
+import psutil
+import time
+
+print("📊 Đang theo dõi RAM usage...")
+print("=" * 60)
+
+while True:
+    ram = psutil.virtual_memory()
+    ram_total = ram.total / (1024**3)
+    ram_used = ram.used / (1024**3)
+    ram_percent = ram.percent
+    
+    print(f"RAM: {ram_used:.2f} / {ram_total:.2f} GB ({ram_percent:.1f}%)", end='\r')
+    time.sleep(5)  # Update mỗi 5 giây
+```
+
+### Xem Training Log
+
 **Tạo cell mới và chạy (để xem log):**
 
 ```python
 # Xem log real-time (chạy cell này trong tab mới để không block)
 import time
+import glob
+import os
 
 log_dir = "/content/drive/MyDrive/ace_step_outputs/logs/vi_lora/lightning_logs"
 log_files = glob.glob(f"{log_dir}/*/events.out.tfevents.*")
@@ -441,20 +496,26 @@ if log_files:
 
 ## 📥 Download Checkpoint về Local
 
-**Sau khi training xong, download checkpoint:**
+**Sau khi training xong, download LoRA checkpoint:**
 
 ```python
-# Tìm checkpoint mới nhất
+# Tìm LoRA checkpoint mới nhất
 import glob
 import os
 
 log_dir = "/content/drive/MyDrive/ace_step_outputs/logs/vi_lora/lightning_logs"
-checkpoints = glob.glob(f"{log_dir}/*/checkpoints/*.ckpt")
+lora_checkpoints = glob.glob(f"{log_dir}/*/checkpoints/*_lora/pytorch_lora_weights.safetensors")
 
-if checkpoints:
-    latest_checkpoint = max(checkpoints, key=os.path.getctime)
-    print(f"✓ Checkpoint mới nhất: {latest_checkpoint}")
+if lora_checkpoints:
+    latest_checkpoint = max(lora_checkpoints, key=os.path.getctime)
+    checkpoint_dir = os.path.dirname(latest_checkpoint)
+    print(f"✓ LoRA checkpoint mới nhất: {checkpoint_dir}")
+    print(f"  File: {os.path.basename(latest_checkpoint)}")
     print(f"  Đã lưu trên Google Drive, có thể download về local")
+    print(f"\n📦 Để sử dụng checkpoint này:")
+    print(f"   1. Download toàn bộ folder: {checkpoint_dir}")
+    print(f"   2. Hoặc chỉ download file: {latest_checkpoint}")
+    print(f"   3. Load vào pipeline bằng: pipeline.load_lora('{checkpoint_dir}', lora_weight=1.0)")
 else:
     print("ℹ Chưa có checkpoint")
 ```
@@ -462,7 +523,12 @@ else:
 **Cách download:**
 1. Mở Google Drive
 2. Vào folder `ace_step_outputs/logs/vi_lora/lightning_logs/.../checkpoints/`
-3. Download file `.ckpt` về máy
+3. Tìm folder có tên `epoch=X-step=Y_lora/`
+4. Download toàn bộ folder hoặc chỉ file `pytorch_lora_weights.safetensors`
+
+**Sử dụng checkpoint:**
+- Checkpoint này là LoRA adapter weights, có thể load vào pipeline để inference
+- File size: ~10-50MB (rất nhỏ so với full model checkpoint)
 
 ---
 
@@ -493,22 +559,62 @@ else:
 - Script sẽ tự động tìm và copy config (Bước 6)
 - Nếu không tìm thấy, có thể sử dụng config mặc định trong repo
 
-### Lỗi: "Out of Memory"
+### Lỗi: "Out of Memory" hoặc "Runtime disconnected" khi khởi tạo
+- **Nguyên nhân**: Code đang load model vào RAM → Colab free (12.7GB) không đủ
+- **Giải pháp**:
+  1. Code đã được tối ưu để load từng phần và clear RAM sau mỗi bước
+  2. Nếu vẫn bị OOM, nâng cấp lên **Colab Pro+** (50GB RAM)
+  3. Hoặc chờ vài phút để code hoàn tất load từng phần (có thể mất 5-10 phút)
+
+### Lỗi: "Out of Memory" khi training
 - Giảm `--accumulate_grad_batches` xuống `2` hoặc `1`
 - Giảm `--num_workers` xuống `0`
+- Giảm `--precision` từ `16` xuống `16-mixed` (nếu có)
 
-### Lỗi: "Runtime disconnected"
-- Resume từ checkpoint mới nhất (Bước 8-10)
+### Lỗi: "Runtime disconnected" khi đang train
+- Code tự động lưu LoRA checkpoint mỗi 50 steps
+- Resume bằng cách chạy lại Bước 10 (code sẽ tự động tìm checkpoint mới nhất)
 - Đảm bảo chạy lại Bước 6 để tìm lại dataset_path
 
 ---
 
 ## 📝 Ghi Chú
 
-- Checkpoint được lưu mỗi **100 steps** (đã set `--every_n_train_steps 100`)
+- **Checkpoint format**: Chỉ lưu LoRA adapter weights (`.safetensors`), không lưu full model checkpoint
+- Checkpoint được lưu mỗi **50 steps** (đã set `--every_n_train_steps 50`)
+- **RAM optimization**: Code đã được tối ưu để load từng phần → phù hợp Colab free (12.7GB RAM)
 - Log được lưu trên Google Drive
-- Có thể resume bất cứ lúc nào từ checkpoint mới nhất
+- Có thể resume bất cứ lúc nào từ checkpoint mới nhất (code tự động tìm và load)
 - Training sẽ tự động dừng khi đạt `max_steps` (20000)
+- **Checkpoint size**: ~10-50MB mỗi checkpoint (rất nhỏ so với full model)
+
+---
+
+## 🎯 Sử dụng Checkpoint sau khi Training
+
+**Sau khi training xong, bạn có thể sử dụng LoRA checkpoint để inference:**
+
+```python
+from acestep.pipeline_ace_step import ACEStepPipeline
+
+# Khởi tạo pipeline
+pipeline = ACEStepPipeline(checkpoint_dir="/content/drive/MyDrive/ace_step_outputs/checkpoints")
+
+# Load LoRA checkpoint
+lora_checkpoint_dir = "/content/drive/MyDrive/ace_step_outputs/logs/vi_lora/lightning_logs/.../checkpoints/epoch=0-step=100_lora"
+pipeline.load_lora(lora_checkpoint_dir, lora_weight=1.0)
+
+# Generate audio
+audio = pipeline(
+    prompt="Nhạc Việt Nam",
+    audio_duration=60.0,
+    format="wav"
+)
+```
+
+**Lưu ý:**
+- `lora_weight`: 0.0-1.0 (1.0 = full strength, 0.5 = half strength)
+- Checkpoint chỉ chứa LoRA weights, không cần load full model checkpoint
 
 ---
 

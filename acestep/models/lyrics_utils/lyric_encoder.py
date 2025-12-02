@@ -256,12 +256,16 @@ class MultiHeadedAttention(nn.Module):
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
             # For last chunk, time2 might be larger than scores.size(-1)
             mask = mask[:, :, :, : scores.size(-1)]  # (batch, 1, *, time2)
-            scores = scores.masked_fill(mask, -float("inf"))
+            finfo = torch.finfo(scores.dtype)
+            # Clamp raw scores to avoid exp overflow before softmax
+            scores = scores.clamp(min=-30.0, max=30.0)
+            scores = scores.masked_fill(mask, finfo.min)
             attn = torch.softmax(scores, dim=-1).masked_fill(
                 mask, 0.0
             )  # (batch, head, time1, time2)
 
         else:
+            scores = scores.clamp(min=-30.0, max=30.0)
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
         p_attn = self.dropout(attn)
