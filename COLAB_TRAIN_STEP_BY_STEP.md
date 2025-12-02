@@ -395,6 +395,10 @@ print("=" * 60)
 - Training sẽ chạy và hiển thị log
 - **Khởi tạo có thể mất 5-10 phút** do code đã được tối ưu để load từng phần (giảm RAM usage)
 - Code sẽ tự động clear RAM sau mỗi bước load model → phù hợp với Colab free (12.7GB RAM)
+- **Bước "Converting transformer to float32" có thể mất 1-3 phút** và tốn nhiều RAM:
+  - Code sẽ convert từng layer để giảm peak RAM
+  - Nếu Colab tự disconnect ở bước này, hãy chờ code hoàn tất hoặc nâng cấp Colab Pro+
+  - Xem log "Đã convert X/Y modules..." để theo dõi tiến trình
 - Checkpoint (LoRA adapter) sẽ được lưu mỗi **50 steps** vào thư mục `checkpoints/epoch=X-step=Y_lora/`
 - **Checkpoint format**: Chỉ lưu LoRA weights (`.safetensors`), không lưu full model → tiết kiệm disk space
 - Dataset path sẽ tự động sử dụng đường dẫn đã tìm thấy ở Bước 6
@@ -560,11 +564,37 @@ else:
 - Nếu không tìm thấy, có thể sử dụng config mặc định trong repo
 
 ### Lỗi: "Out of Memory" hoặc "Runtime disconnected" khi khởi tạo
-- **Nguyên nhân**: Code đang load model vào RAM → Colab free (12.7GB) không đủ
-- **Giải pháp**:
-  1. Code đã được tối ưu để load từng phần và clear RAM sau mỗi bước
-  2. Nếu vẫn bị OOM, nâng cấp lên **Colab Pro+** (50GB RAM)
-  3. Hoặc chờ vài phút để code hoàn tất load từng phần (có thể mất 5-10 phút)
+
+**Triệu chứng:**
+- Colab tự động disconnect ở bước "Converting transformer to float32..."
+- RAM tăng đột ngột và Colab tự động restart
+- Log dừng ở "Converting transformer to float32..." và không có output tiếp theo
+
+**Nguyên nhân:**
+- Bước convert transformer sang float32 tạo bản copy toàn bộ model trong RAM
+- Colab free (12.7GB RAM) có thể không đủ khi peak RAM tăng gấp đôi tạm thời
+- Colab có thể tự động disconnect khi RAM usage quá cao hoặc process chạy quá lâu
+
+**Giải pháp:**
+
+1. **Code đã được tối ưu:**
+   - Convert từng layer thay vì toàn bộ model → giảm peak RAM
+   - Clear cache sau mỗi 10 modules
+   - Logging RAM usage để theo dõi
+   - Progress logging: "Đã convert X/Y modules..."
+
+2. **Nếu vẫn bị disconnect:**
+   - **Option 1**: Nâng cấp lên **Colab Pro+** (50GB RAM) - **khuyến nghị**
+   - **Option 2**: Chờ code hoàn tất (có thể mất 2-3 phút ở bước convert)
+     - Xem log "Đã convert X/Y modules..." để biết code đang chạy
+     - Nếu thấy "RAM trước/sau khi convert", code đang hoạt động bình thường
+   - **Option 3**: Chạy lại và theo dõi log - code sẽ tự động fallback nếu OOM
+     - Nếu thấy "Model giữ ở dtype gốc", code đã fallback (vẫn train được nhưng có thể kém ổn định hơn)
+
+3. **Theo dõi tiến trình:**
+   - Xem log "Đã convert X/Y modules..." để biết code đang chạy
+   - Nếu thấy "RAM trước/sau khi convert", code đang hoạt động bình thường
+   - Nếu không có output trong 3-5 phút, có thể Colab đã disconnect
 
 ### Lỗi: "Out of Memory" khi training
 - Giảm `--accumulate_grad_batches` xuống `2` hoặc `1`

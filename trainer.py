@@ -155,14 +155,81 @@ class Pipeline(LightningModule):
         gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
+        # Log RAM usage trước khi convert
+        try:
+            import psutil
+            ram_before = psutil.virtual_memory()
+            logger.info(f"RAM trước khi convert: {ram_before.used / (1024**3):.2f} / {ram_before.total / (1024**3):.2f} GB ({ram_before.percent:.1f}%)")
+        except:
+            pass
+        
         # Convert sang float32 (có thể tốn RAM, nhưng cần cho training ổn định)
+        # Chia nhỏ quá trình convert để tránh peak RAM quá cao
         logger.info("Converting transformer to float32...")
-        transformers = acestep_pipeline.ace_step_transformer.float()
-        transformers.enable_gradient_checkpointing()
+        logger.info("⚠️ Lưu ý: Quá trình này có thể tốn nhiều RAM và mất 1-2 phút...")
+        logger.info("⚠️ Nếu Colab tự disconnect, hãy thử Colab Pro hoặc giảm batch size...")
+        
+        # Thử convert với error handling và progress logging
+        try:
+            # Strategy: Convert từng layer để giảm peak RAM
+            logger.info("Bắt đầu convert từng layer...")
+            transformer = acestep_pipeline.ace_step_transformer
+            
+            # Convert từng named module để giảm peak RAM
+            # Đếm số lượng modules để show progress
+            total_modules = sum(1 for _ in transformer.named_modules())
+            logger.info(f"Tổng số modules cần convert: {total_modules}")
+            
+            converted_count = 0
+            for name, module in transformer.named_modules():
+                if len(list(module.parameters())) > 0:  # Chỉ convert modules có parameters
+                    try:
+                        # Convert module sang float32
+                        module.float()
+                        converted_count += 1
+                        if converted_count % 10 == 0:
+                            logger.info(f"Đã convert {converted_count}/{total_modules} modules...")
+                            # Clear cache sau mỗi 10 modules
+                            gc.collect()
+                            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    except Exception as e:
+                        logger.warning(f"Không thể convert module {name}: {e}, bỏ qua...")
+                        continue
+            
+            transformers = transformer
+            transformers.enable_gradient_checkpointing()
+            logger.info(f"✓ Transformer converted to float32 successfully ({converted_count} modules)")
+        except Exception as e:
+            logger.warning(f"⚠️ Lỗi khi convert từng layer: {e}")
+            logger.info("Thử convert toàn bộ model...")
+            try:
+                # Fallback: convert toàn bộ
+                transformers = acestep_pipeline.ace_step_transformer.float()
+                transformers.enable_gradient_checkpointing()
+                logger.info("✓ Transformer converted to float32 successfully (full conversion)")
+            except RuntimeError as e2:
+                if "out of memory" in str(e2).lower() or "memory" in str(e2).lower():
+                    logger.error(f"❌ Out of memory khi convert transformer: {e2}")
+                    logger.warning("⚠️ Giữ model ở dtype gốc (có thể ảnh hưởng training stability)...")
+                    # Fallback: giữ dtype gốc
+                    transformers = acestep_pipeline.ace_step_transformer
+                    transformers.enable_gradient_checkpointing()
+                    logger.warning("⚠️ Model giữ ở dtype gốc, không convert sang float32")
+                else:
+                    raise
         
         # Clear RAM sau khi convert
         gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Log RAM usage sau khi convert
+        try:
+            import psutil
+            ram_after = psutil.virtual_memory()
+            logger.info(f"RAM sau khi convert: {ram_after.used / (1024**3):.2f} / {ram_after.total / (1024**3):.2f} GB ({ram_after.percent:.1f}%)")
+        except:
+            pass
+        
         logger.info("Transformer converted and gradient checkpointing enabled")
 
         # Step 2: Load LoRA adapter (sau khi đã clear RAM)
